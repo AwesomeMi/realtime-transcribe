@@ -1,22 +1,23 @@
 #!/usr/bin/env python3
 """
-Realtime-транскрипция через Groq Whisper API. Захват — PipeWire/PulseAudio.
+Realtime transcription via the Groq Whisper API. Capture — PipeWire/PulseAudio.
 
-  ./rt.py                     # системный звук (Zoom, браузер, колонки)
-  ./rt.py -s mic -l uk        # микрофон
-  ./rt.py -s both             # оба источника, строки помечаются [mic]/[spk]
+  ./rt.py                     # system audio (Zoom, browser, speakers)
+  ./rt.py -s mic -l uk        # microphone
+  ./rt.py -s both             # both sources, lines tagged [mic]/[spk]
   ./rt.py --list-devices
-  ./rt.py --quota             # сколько лимитов осталось
+  ./rt.py --quota             # how much of the limits is left
 
-Горячие клавиши:
-  space — пауза, m — метка, q — стоп и сохранить
-  /     — спросить Gemini по расшифровке:
-            Enter       — контекст из последних N реплик (--recent, по умолчанию 8)
-            Shift+Enter — контекст из всей расшифровки
-            Esc         — отменить ввод
+Hotkeys:
+  space — pause, m — mark, q — stop and save
+  /     — ask Gemini about the last N lines (--recent, 8 by default)
+  ?     — ask about the whole transcript
+            Shift+Enter — also "whole transcript" (needs the kitty keyboard
+                          protocol; Windows has none, so only `?` works there)
+            Esc         — cancel input, Ctrl+U — clear the line
 
-Ключи: $GROQ_API_KEY или ~/.config/transcribe/key
-       $GEMINI_API_KEY или ~/.config/transcribe/gemini_key
+Keys: $GROQ_API_KEY or ~/.config/transcribe/key
+      $GEMINI_API_KEY or ~/.config/transcribe/gemini_key
 """
 
 import argparse
@@ -31,15 +32,12 @@ import queue
 import re
 import select
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
-import termios
 import textwrap
 import threading
 import time
-import tty
 import wave
 from datetime import datetime
 from pathlib import Path
@@ -47,7 +45,15 @@ from pathlib import Path
 import numpy as np
 import requests
 
-# --- аудио ---------------------------------------------------------------
+IS_WINDOWS = os.name == "nt"
+if IS_WINDOWS:
+    import ctypes
+    import msvcrt
+else:
+    import termios
+    import tty
+
+# --- audio ---------------------------------------------------------------
 SAMPLE_RATE = 16000
 FRAME_MS = 20
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000       # 320
@@ -57,22 +63,28 @@ FRAME_BYTES = FRAME_SAMPLES * 2                      # s16le mono
 GROQ_URL = "https://api.groq.com/openai/v1/audio/transcriptions"
 MODELS = {"turbo": "whisper-large-v3-turbo", "large": "whisper-large-v3"}
 
-# лимиты free tier
+# free tier limits
 LIMIT_RPM = 20
 LIMIT_RPD = 2000
-LIMIT_ASH = 7200      # секунд аудио в час
-LIMIT_ASD = 28800     # секунд аудио в сутки
-MIN_BILLED = 10       # короче — всё равно тарифицируется как 10с
+LIMIT_ASH = 7200      # seconds of audio per hour
+LIMIT_ASD = 28800     # seconds of audio per day
+MIN_BILLED = 10       # anything shorter is still billed as 10s
 
-STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "transcribe"
-CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "transcribe"
+if IS_WINDOWS:
+    _APPDATA = Path(os.environ.get("APPDATA") or Path.home())
+    CONFIG_DIR = _APPDATA / "transcribe"
+    STATE_DIR = Path(os.environ.get("LOCALAPPDATA") or _APPDATA) / "transcribe"
+else:
+    STATE_DIR = Path(os.environ.get("XDG_STATE_HOME",
+                                    Path.home() / ".local/state")) / "transcribe"
+    CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "transcribe"
 
 LABELS = {"mic": "mic", "speaker": "spk"}
 
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 
-# Цепочка фолбэка: сверху качественные, но с 20 запросами в сутки; ниже —
-# запасные с 500 и 14400. Числа — суточные лимиты free tier на 2026-09-02.
+# Fallback chain: the good ones on top, but with 20 requests per day; below —
+# the backups with 500 and 14400. Numbers are free tier daily limits as of 2026-09-02.
 GEMINI_CHAIN = [
     ("gemini-3.7-flash", 20),
     ("gemini-3.6-flash", 20),
@@ -84,11 +96,11 @@ GEMINI_CHAIN = [
     ("gemma-4-31b-it", 14400),
 ]
 GEMINI_SYSTEM = (
-    "Ты помогаешь студенту прямо во время лекции. Тебе дают расшифровку речи из "
-    "автоматического распознавания: в ней бывают ошибки, имена и термины могут быть "
-    "искажены, пунктуация неточная — учитывай это и не цепляйся к опечаткам. "
-    "Отвечай кратко и по делу, на языке вопроса. Если в расшифровке нет ответа, "
-    "так и скажи, не выдумывай."
+    "You are helping a student in the middle of a lecture. You are given a speech "
+    "transcript produced by automatic recognition: it contains errors, names and terms "
+    "may be garbled, punctuation is imprecise — keep that in mind and do not nitpick "
+    "typos. Answer briefly and to the point, in the language of the question. If the "
+    "transcript does not contain the answer, say so instead of making things up."
 )
 
 
@@ -100,14 +112,14 @@ def hms(sec):
 def compact(sec):
     sec = int(sec)
     if sec >= 3600:
-        return f"{sec // 3600}ч{sec % 3600 // 60:02d}м"
+        return f"{sec // 3600}h{sec % 3600 // 60:02d}m"
     if sec >= 60:
-        return f"{sec // 60}м"
-    return f"{sec}с"
+        return f"{sec // 60}m"
+    return f"{sec}s"
 
 
 # ==========================================================================
-# Устройства
+# Devices
 # ==========================================================================
 
 def pactl(*args):
@@ -118,8 +130,66 @@ def pactl(*args):
         return ""
 
 
+def _win_pa():
+    """PyAudioWPatch is imported lazily: it is not needed on Linux."""
+    try:
+        import pyaudiowpatch
+        return pyaudiowpatch
+    except ImportError:
+        die("on Windows PyAudioWPatch is required: pip install PyAudioWPatch")
+
+
+def _win_device_id(index):
+    return f"wasapi:{index}"
+
+
+def _win_device_index(device):
+    try:
+        prefix, index = device.split(":", 1)
+        if prefix != "wasapi":
+            raise ValueError
+        return int(index)
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError(f"invalid WASAPI device id: {device!r}") from None
+
+
+def _win_sources():
+    pa = _win_pa()
+    out = []
+    with pa.PyAudio() as audio:
+        host = audio.get_host_api_info_by_type(pa.paWASAPI)
+        for index in range(audio.get_device_count()):
+            d = audio.get_device_info_by_index(index)
+            if d["hostApi"] != host["index"] or d.get("maxInputChannels", 0) <= 0:
+                continue
+            is_loopback = bool(d.get("isLoopbackDevice"))
+            desc = f"Monitor of {d['name'].removesuffix(' [Loopback]')}" if is_loopback else d["name"]
+            out.append((_win_device_id(index), desc, is_loopback))
+    return out
+
+
+def _win_default_mic():
+    try:
+        pa = _win_pa()
+        with pa.PyAudio() as audio:
+            return _win_device_id(audio.get_default_wasapi_device(d_in=True)["index"])
+    except Exception:
+        return None
+
+
+def _win_default_monitor():
+    try:
+        pa = _win_pa()
+        with pa.PyAudio() as audio:
+            return _win_device_id(audio.get_default_wasapi_loopback()["index"])
+    except Exception:
+        return None
+
+
 def all_sources():
-    """[(name, description, is_monitor)] — все источники записи."""
+    """[(name, description, is_monitor)] — every recording source."""
+    if IS_WINDOWS:
+        return _win_sources()
     out = []
     raw = pactl("-f", "json", "list", "sources")
     if raw:
@@ -139,49 +209,53 @@ def all_sources():
 
 
 def default_mic():
+    if IS_WINDOWS:
+        return _win_default_mic()
     return pactl("get-default-source") or None
 
 
 def default_monitor():
+    if IS_WINDOWS:
+        return _win_default_monitor()
     sink = pactl("get-default-sink")
     return f"{sink}.monitor" if sink else None
 
 
 def resolve_source(kind, hint):
-    """kind: 'mic' | 'speaker'. hint — часть имени или описания."""
+    """kind: 'mic' | 'speaker'. hint — part of the name or description."""
     srcs = all_sources()
     if hint:
         h = hint.lower()
         for name, desc, is_mon in srcs:
             if h in name.lower() or h in desc.lower():
                 return name
-        die(f"устройство '{hint}' не найдено, глянь --list-devices")
+        die(f"device '{hint}' not found, check --list-devices")
     name = default_monitor() if kind == "speaker" else default_mic()
     if not name:
-        die(f"не удалось определить устройство по умолчанию для '{kind}'")
+        die(f"could not determine the default device for '{kind}'")
     known = {s[0] for s in srcs}
     if name not in known:
-        # монитор дефолтного сина может быть не поднят — берём первый подходящий
+        # the default sink's monitor may not be up — take the first matching one
         want_mon = kind == "speaker"
         for n, _d, is_mon in srcs:
             if is_mon == want_mon:
                 return n
-        die(f"нет доступного источника для '{kind}'")
+        die(f"no available source for '{kind}'")
     return name
 
 
 def list_devices():
     srcs = all_sources()
     dm, dmon = default_mic(), default_monitor()
-    print("\n=== Микрофоны (--source mic) ===")
+    print("\n=== Microphones (--source mic) ===")
     for name, desc, is_mon in srcs:
         if not is_mon:
             print(f"  {'*' if name == dm else ' '} {desc}\n      {name}")
-    print("\n=== Мониторы вывода — системный звук (--source speaker) ===")
+    print("\n=== Output monitors — system audio (--source speaker) ===")
     for name, desc, is_mon in srcs:
         if is_mon:
             print(f"  {'*' if name == dmon else ' '} {desc}\n      {name}")
-    print("\n* — по умолчанию.  Выбрать другое: --mic-device ЧАСТЬ_ИМЕНИ / --speaker-device ЧАСТЬ_ИМЕНИ\n")
+    print("\n* — default.  Pick another: --mic-device NAME_PART / --speaker-device NAME_PART\n")
 
 
 def die(msg):
@@ -190,7 +264,7 @@ def die(msg):
 
 
 # ==========================================================================
-# Учёт лимитов (скользящие окна час / сутки, переживает перезапуск)
+# Quota accounting (sliding hour / day windows, survives a restart)
 # ==========================================================================
 
 class Usage:
@@ -229,7 +303,7 @@ class Usage:
             ev = list(self.events)
         rpm = sum(1 for t, _ in ev if t >= now - 60)
         req_h = sum(1 for t, _ in ev if t >= now - 3600)
-        day = now - 24 * 3600      # хранимое окно длиннее, режем явно
+        day = now - 24 * 3600      # the stored window is longer, cut it explicitly
         req_d = sum(1 for t, _ in ev if t >= day)
         sec_h = sum(s for t, s in ev if t >= now - 3600)
         sec_d = sum(s for t, s in ev if t >= day)
@@ -240,39 +314,39 @@ class Usage:
 def print_quota(usage):
     st = usage.stats()
     print(f"""
-Расход за скользящие окна (локальный учёт, free tier):
+Usage over the sliding windows (local accounting, free tier):
 
-  запросов за минуту   {st['rpm']:>6} / {LIMIT_RPM}
-  запросов за сутки    {st['req_day']:>6} / {LIMIT_RPD}
-  аудио за час         {compact(st['sec_hour']):>6} / {compact(LIMIT_ASH)}
-  аудио за сутки       {compact(st['sec_day']):>6} / {compact(LIMIT_ASD)}
+  requests per minute  {st['rpm']:>6} / {LIMIT_RPM}
+  requests per day     {st['req_day']:>6} / {LIMIT_RPD}
+  audio per hour       {compact(st['sec_hour']):>6} / {compact(LIMIT_ASH)}
+  audio per day        {compact(st['sec_day']):>6} / {compact(LIMIT_ASD)}
 
-  осталось на сегодня  ~{compact(max(0, LIMIT_ASD - st['sec_day']))} аудио,
-                       ~{LIMIT_RPD - st['req_day']} запросов
+  left for today       ~{compact(max(0, LIMIT_ASD - st['sec_day']))} of audio,
+                       ~{LIMIT_RPD - st['req_day']} requests
 """)
 
 
 # ==========================================================================
-# VAD по энергии с адаптивным порогом шума
+# Energy-based VAD with an adaptive noise threshold
 # ==========================================================================
 
 class Vad:
-    """Порог = шумовой пол (p10 за последнюю минуту) x3, зажатый снизу и сверху.
+    """Threshold = noise floor (p10 over the last minute) x3, clamped both ways.
 
-    Подобрано на реальной записи лекции: на плотной речи пропускает 95% кадров,
-    на паузах отсекает ~75% входа. Смещено в сторону «лучше лишнее отправить,
-    чем потерять тихую речь».
+    Tuned on a real lecture recording: on dense speech it lets 95% of the frames
+    through, on pauses it cuts ~75% of the input. Biased towards "better to send
+    something extra than to lose quiet speech".
     """
 
-    ENTER_FRAMES = 3      # 60мс речи — включаемся
-    EXIT_FRAMES = 25      # 500мс тишины — выключаемся
+    ENTER_FRAMES = 3      # 60ms of speech — turn on
+    EXIT_FRAMES = 25      # 500ms of silence — turn off
     FLOOR_PCT = 10
     MULT = 3.0
-    ABS_MIN = 0.0015      # ниже — цифровая тишина
-    ABS_MAX = 0.02        # выше не поднимаемся даже в шумной аудитории
+    ABS_MIN = 0.0015      # below this — digital silence
+    ABS_MAX = 0.02        # never go higher, even in a noisy lecture hall
 
     def __init__(self, fixed=None):
-        self.hist = collections.deque(maxlen=3000)   # 60с RMS
+        self.hist = collections.deque(maxlen=3000)   # 60s of RMS
         self.speaking = False
         self.disagree = 0
         self.fixed = fixed
@@ -300,11 +374,11 @@ class Vad:
 
 
 # ==========================================================================
-# Нарезка на куски по паузам
+# Splitting into chunks on pauses
 # ==========================================================================
 
 class Chunker:
-    PAD_FRAMES = 10       # 200мс хвоста после речи
+    PAD_FRAMES = 10       # 200ms of tail after speech
 
     def __init__(self, src, min_sec, max_sec, silence_sec, emit):
         self.src = src
@@ -353,20 +427,67 @@ class Chunker:
 
 
 # ==========================================================================
-# Захват
+# Capture
 # ==========================================================================
 
-class Capture(threading.Thread):
+class WindowsCapture(threading.Thread):
+    """Capture microphones and output loopbacks through WASAPI via PyAudioWPatch."""
+
+    def __init__(self, src, device, sink, stop, state):
+        super().__init__(daemon=True)
+        self.src, self.device, self.sink, self.stop, self.state = src, device, sink, stop, state
+
+    def run(self):
+        pa = _win_pa()
+        try:
+            audio = pa.PyAudio()
+            index = _win_device_index(self.device)
+            info = audio.get_device_info_by_index(index)
+            rate = int(info["defaultSampleRate"])
+            channels = min(2, int(info["maxInputChannels"]))
+            native_frames = round(rate * FRAME_MS / 1000)
+            stream = audio.open(format=pa.paFloat32, channels=channels, rate=rate,
+                                input=True, input_device_index=index,
+                                frames_per_buffer=native_frames)
+        except Exception as e:
+            if "audio" in locals():
+                audio.terminate()
+            self.state.fatal = f"device {self.device!r} failed to open: {type(e).__name__}: {e!r}"
+            self.stop.set()
+            return
+        try:
+            while not self.stop.is_set():
+                raw = stream.read(native_frames, exception_on_overflow=False)
+                data = np.frombuffer(raw, dtype=np.float32).reshape(-1, channels)
+                frame = data.mean(axis=1)
+                if len(frame) != FRAME_SAMPLES:
+                    if len(frame) % FRAME_SAMPLES == 0:
+                        frame = frame.reshape(FRAME_SAMPLES, -1).mean(axis=1)
+                    else:
+                        x = np.linspace(0, len(frame) - 1, FRAME_SAMPLES)
+                        frame = np.interp(x, np.arange(len(frame)), frame)
+                self.sink(self.src, np.ascontiguousarray(frame, dtype=np.float32))
+        except Exception as e:
+            if not self.stop.is_set():
+                self.state.fatal = f"stream {self.src} died: {type(e).__name__}: {e!r}"
+                self.stop.set()
+        finally:
+            stream.stop_stream()
+            stream.close()
+            audio.terminate()
+
+
+class PosixCapture(threading.Thread):
     def __init__(self, src, device, sink, stop, state):
         super().__init__(daemon=True)
         self.src, self.device, self.sink, self.stop, self.state = src, device, sink, stop, state
         self.proc = None
 
     def _read_frame(self):
-        """Дочитывает ровно кадр.
+        """Reads exactly one frame.
 
-        read() вправе вернуть меньше запрошенного — это нормальное короткое
-        чтение, а не обрыв. Обрыв — только пустой ответ (EOF).
+        read() may return less than requested — that is a normal short read,
+        not a broken stream. Only an empty result (EOF) means it is broken.
         """
         buf = b""
         while len(buf) < FRAME_BYTES:
@@ -383,7 +504,7 @@ class Capture(threading.Thread):
             self.proc = subprocess.Popen(cmd, stdout=subprocess.PIPE,
                                          stderr=subprocess.DEVNULL, bufsize=0)
         except FileNotFoundError:
-            self.state.fatal = "parec не найден (нужен пакет libpulse / pipewire-pulse)"
+            self.state.fatal = "parec not found (needs the libpulse / pipewire-pulse package)"
             self.stop.set()
             return
         while not self.stop.is_set():
@@ -391,7 +512,7 @@ class Capture(threading.Thread):
             if data is None:
                 if self.stop.is_set():
                     break
-                self.state.fatal = f"поток {self.src} оборвался"
+                self.state.fatal = f"stream {self.src} died"
                 self.stop.set()
                 break
             frame = np.frombuffer(data, "<i2").astype(np.float32) / 32768.0
@@ -401,7 +522,7 @@ class Capture(threading.Thread):
 
 
 # ==========================================================================
-# Бэкенды распознавания
+# Recognition backends
 # ==========================================================================
 
 def to_wav(audio):
@@ -416,7 +537,7 @@ def to_wav(audio):
 
 
 def retry_after(value, fallback):
-    """Retry-After бывает числом, числом с единицей ('7.66s') и HTTP-датой."""
+    """Retry-After can be a number, a number with a unit ('7.66s') or an HTTP date."""
     if value:
         m = re.match(r"\s*([\d.]+)\s*s?\s*$", value)
         if m:
@@ -457,11 +578,11 @@ class GroqBackend:
                 delay *= 2
                 continue
             raise RuntimeError(f"HTTP {r.status_code}: {r.text[:200]}")
-        raise RuntimeError("не удалось после 4 попыток")
+        raise RuntimeError("failed after 4 attempts")
 
 
 class Gemini:
-    """Interactions API — текущий интерфейс Gemini (v1beta/interactions)."""
+    """Interactions API — the current Gemini interface (v1beta/interactions)."""
 
     def __init__(self, key, chain, thinking="low"):
         self.key = key
@@ -469,25 +590,25 @@ class Gemini:
         self.limits = dict(chain)
         self.thinking = thinking
         self.session = requests.Session()
-        # per-model: thinking — принимает ли модель thinking_level (у gemma свой
-        # словарь уровней); until — до какого времени пропускать; dead — квота
-        # на сутки выбрана, до конца сессии не трогаем.
+        # per-model: thinking — whether the model accepts thinking_level (gemma has
+        # its own level vocabulary); until — skip it until this time; dead — the daily
+        # quota is used up, do not touch it until the end of the session.
         self.state = {m: {"thinking": True, "until": 0.0, "dead": False}
                       for m in self.chain}
 
     @staticmethod
     def _extract(d):
-        """Текст лежит в steps[] под type=model_output.
+        """The text lives in steps[] under type=model_output.
 
-        В доках описано поле output_text, но API его не возвращает — берём его
-        только если однажды появится, а основной путь идёт по steps.
+        The docs describe an output_text field, but the API does not return it — we
+        read it only in case it ever shows up, the main path goes through steps.
         """
         if d.get("output_text"):
             return d["output_text"].strip()
         outs = []
         for step in d.get("steps") or []:
             if step.get("type") != "model_output":
-                continue                        # пропускаем блоки type=thought
+                continue                        # skip type=thought blocks
             txt = "\n".join(c["text"] for c in step.get("content") or []
                              if isinstance(c, dict) and c.get("text"))
             if txt:
@@ -509,7 +630,7 @@ class Gemini:
             headers={"x-goog-api-key": self.key, "Content-Type": "application/json"})
 
         if r.status_code == 400 and "thinking" in r.text.lower() and retry_without_thinking:
-            st["thinking"] = False          # у модели свой словарь уровней — идём без него
+            st["thinking"] = False          # the model has its own levels — go without it
             return self._call(model, prompt, retry_without_thinking=False)
         if r.status_code == 429:
             daily = any(w in r.text.lower() for w in ("per day", "perday", "daily"))
@@ -517,17 +638,17 @@ class Gemini:
                 st["dead"] = True
             else:
                 st["until"] = time.time() + 60
-            raise RuntimeError("квота на сутки" if daily else "лимит в минуту")
+            raise RuntimeError("daily quota" if daily else "per-minute limit")
         if r.status_code != 200:
             raise RuntimeError(f"HTTP {r.status_code}: {r.text[:160]}")
         text = self._extract(r.json())
         if not text:
-            raise RuntimeError(f"пустой ответ: {json.dumps(r.json())[:200]}")
+            raise RuntimeError(f"empty response: {json.dumps(r.json())[:200]}")
         return text
 
     def ask(self, context, question):
-        """Возвращает (ответ, модель). Идёт по цепочке, пока кто-то не ответит."""
-        prompt = f"Расшифровка лекции:\n\n{context}\n\n---\n\nВопрос: {question}"
+        """Returns (answer, model). Walks the chain until someone answers."""
+        prompt = f"Lecture transcript:\n\n{context}\n\n---\n\nQuestion: {question}"
         problems = []
         now = time.time()
         for model in self.chain:
@@ -538,21 +659,24 @@ class Gemini:
                 return self._call(model, prompt), model
             except Exception as e:
                 problems.append(f"{model}: {e}")
-        raise RuntimeError("все модели недоступны — " + "; ".join(problems[-3:]))
+        raise RuntimeError("all models unavailable — " + "; ".join(problems[-3:]))
+
+
+Capture = WindowsCapture if IS_WINDOWS else PosixCapture
 
 
 class GeminiLive(threading.Thread):
-    """Непрерывная транскрипция через Live API (WebSocket).
+    """Continuous transcription via the Live API (WebSocket).
 
-    Живёт в своём потоке с asyncio-циклом. Аудио кладётся через feed() из потока
-    захвата, копится в буфере, оттуда уходит кусками по 100мс.
+    Lives in its own thread with an asyncio loop. Audio is pushed in with feed() from
+    the capture thread, piles up in a buffer and leaves it in 100ms chunks.
 
-    Замеренное поведение модели: промежуточные расшифровки кумулятивны и растут,
-    пока не придёт финал, после чего счётчик сбрасывается. Свои финалы модель
-    отбивает редко — при непрерывной речи может молчать минутами, — поэтому если
-    финала нет дольше flush_sec, сессия закрывается принудительно (audioStreamEnd
-    заставляет отдать финал) и открывается заново. Аудио на время пересоздания
-    копится в том же буфере, так что ничего не теряется.
+    Measured model behaviour: interim transcripts are cumulative and keep growing
+    until a final arrives, after which the counter resets. The model emits finals of
+    its own rarely — on continuous speech it can stay silent for minutes — so if
+    there is no final for longer than flush_sec, the session is closed by force
+    (audioStreamEnd makes it hand over a final) and reopened. While the session is
+    being recreated, audio piles up in the same buffer, so nothing is lost.
     """
 
     URL = ("wss://generativelanguage.googleapis.com/ws/"
@@ -576,9 +700,9 @@ class GeminiLive(threading.Thread):
         self.sent_sec = 0.0
         self.sessions = 0
         self.connected = False
-        self.speaking = False     # ставится снаружи по VAD: в паузе ротировать безопасно
+        self.speaking = False     # set from outside by VAD: rotating during a pause is safe
 
-    # --- со стороны потока захвата ---
+    # --- from the capture thread side ---
     def feed(self, frame):
         pcm = (np.clip(frame, -1.0, 1.0) * 32767).astype("<i2").tobytes()
         with self.lock:
@@ -592,12 +716,12 @@ class GeminiLive(threading.Thread):
             del self.buf[:self.CHUNK_BYTES]
             return out
 
-    # --- поток ---
+    # --- thread ---
     def run(self):
         try:
             asyncio.run(self._main())
         except Exception as e:
-            self.on_note(f"Live API остановлен: {e}")
+            self.on_note(f"Live API stopped: {e}")
 
     async def _main(self):
         backoff = 2.0
@@ -609,7 +733,7 @@ class GeminiLive(threading.Thread):
                 self.connected = False
                 if self.stop.is_set():
                     break
-                self.on_note(f"обрыв Live API ({e}) — переподключаюсь через {backoff:.0f}с")
+                self.on_note(f"Live API dropped ({e}) — reconnecting in {backoff:.0f}s")
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 30)
 
@@ -632,7 +756,7 @@ class GeminiLive(threading.Thread):
             first = await asyncio.wait_for(ws.recv(), timeout=30)
             raw = first if isinstance(first, str) else first.decode(errors="replace")
             if "setupComplete" not in raw:
-                raise RuntimeError(f"setup отклонён: {raw[:200]}")
+                raise RuntimeError(f"setup rejected: {raw[:200]}")
             self.connected = True
             self.sessions += 1
 
@@ -667,10 +791,11 @@ class GeminiLive(threading.Thread):
                             "mimeType": f"audio/pcm;rate={SAMPLE_RATE}"}}}))
                         self.sent_sec += self.CHUNK_MS / 1000
 
-                    # Финала давно нет — форсируем, иначе текст копится до конца пары.
-                    # Рвём только в паузе: обрыв посреди слова заставляет модель
-                    # выбросить недоговорённый хвост, и фраза теряется. Если речь
-                    # не прекращается, ждём до двойного срока и рвём всё равно.
+                    # No final for a long time — force one, otherwise the text piles
+                    # up until the end of the class. Cut only during a pause: a cut in
+                    # mid-word makes the model drop the unfinished tail and the phrase
+                    # is lost. If speech never stops, wait up to twice as long and cut
+                    # anyway.
                     overdue = time.time() - last_final[0]
                     if overdue > self.flush_sec and (not self.speaking
                                                      or overdue > self.flush_sec * 2):
@@ -678,14 +803,14 @@ class GeminiLive(threading.Thread):
                         mark = last_final[0]
                         deadline = time.time() + 8
                         while time.time() < deadline and not rx.done():
-                            # ждём, пока финалы не перестанут приходить: их может
-                            # быть несколько, и уйти по первому значит потерять хвост
+                            # wait until the finals stop coming: there may be
+                            # several, and leaving on the first one loses the tail
                             if last_final[0] != mark and time.time() - last_final[0] > 1.5:
                                 break
                             await asyncio.sleep(0.1)
-                        return                              # переподключаемся
+                        return                              # reconnect
 
-                # штатная остановка — добираем хвост
+                # normal shutdown — collect the tail
                 if self.stop.is_set():
                     while True:
                         chunk = self._take()
@@ -705,7 +830,7 @@ class GeminiLive(threading.Thread):
 
 
 class LocalBackend:
-    """Оффлайн-фолбэк на faster-whisper. Здесь не проверялся — нужен pip install."""
+    """Offline fallback on faster-whisper. Untested here — needs a pip install."""
 
     def __init__(self, model, lang):
         from faster_whisper import WhisperModel
@@ -722,48 +847,57 @@ class LocalBackend:
 
 
 # ==========================================================================
-# Экран: прокручиваемая область + закреплённая строка статуса
+# Screen: scrolling region + pinned status line
 # ==========================================================================
+
+def enable_vt():
+    """Old conhost does not understand ANSI until VT output processing is on."""
+    if not IS_WINDOWS:
+        return
+    try:
+        k = ctypes.windll.kernel32
+        handle = k.GetStdHandle(-11)                  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if k.GetConsoleMode(handle, ctypes.byref(mode)):
+            k.SetConsoleMode(handle, mode.value | 0x0004)   # VIRTUAL_TERMINAL_PROCESSING
+    except Exception:
+        pass
+
 
 class Screen:
     def __init__(self, tui):
         self.tui = tui and sys.stdout.isatty()
         self.lock = threading.RLock()
         self.status = ""
-        self.input = None          # не None => внизу строка ввода вопроса
+        self.input = None          # not None => question input line at the bottom
+        self.input_full = False    # which scope was picked when it opened
         self.old_term = None
-        self.dirty_size = False    # SIGWINCH только поднимает флаг, см. _apply_resize
         self.w, self.h = shutil.get_terminal_size((100, 24))
         if not self.tui:
             return
-        sys.stdout.write("\x1b[?25l")                 # спрятать курсор
-        sys.stdout.write(f"\x1b[1;{self.h - 1}r")     # область прокрутки
+        enable_vt()
+        sys.stdout.write("\x1b[?25l")                 # hide the cursor
+        sys.stdout.write(f"\x1b[1;{self.h - 1}r")     # scrolling region
         sys.stdout.write(f"\x1b[{self.h - 1};1H")
-        sys.stdout.write("\x1b[>1u")                  # kitty keyboard: различать Shift+Enter
+        sys.stdout.write("\x1b[>1u")                  # kitty keyboard: tell Shift+Enter apart
         sys.stdout.flush()
-        try:
-            signal.signal(signal.SIGWINCH, self._resize)
-        except ValueError:
-            pass
-
-    def _resize(self, *_):
-        """Обработчик сигнала: только флаг, никакого вывода.
-
-        Сигналы исполняются в основном потоке между байткодами, а lock здесь
-        реентрантный — обработчик спокойно захватит его повторно и вклинит свои
-        escape-последовательности в середину чужой записи. Поэтому вся работа
-        отложена в _apply_resize, который вызывается из обычного кода.
-        """
-        self.dirty_size = True
 
     def _apply_resize(self):
-        if not self.dirty_size:
+        """The size is polled instead of catching SIGWINCH.
+
+        There is no SIGWINCH on Windows, and on Unix the handler runs in the
+        main thread between bytecodes and, since the lock is reentrant, it
+        happily wedged its own escape sequences into the middle of someone
+        else's write. The poll is called from _draw() — that is, at least once
+        every 0.25s — and costs a single ioctl call.
+        """
+        size = shutil.get_terminal_size((100, 24))
+        if (size.columns, size.lines) == (self.w, self.h):
             return
-        self.dirty_size = False
         old_h = self.h
-        self.w, self.h = shutil.get_terminal_size((100, 24))
-        # при увеличении окна прежняя строка статуса оказывается внутри области
-        # прокрутки и остаётся там мусором — стираем её на старом месте
+        self.w, self.h = size
+        # when the window grows, the old status line ends up inside the scrolling
+        # region and stays there as garbage — erase it at its old position
         sys.stdout.write(f"\x1b[{old_h};1H\x1b[2K")
         sys.stdout.write(f"\x1b[r\x1b[1;{self.h - 1}r")
         sys.stdout.write(f"\x1b[{self.h - 1};1H")
@@ -771,6 +905,8 @@ class Screen:
     def raw_input_mode(self):
         if not (self.tui and sys.stdin.isatty()):
             return
+        if IS_WINDOWS:
+            return                  # msvcrt reads without echo, no mode change needed
         self.old_term = termios.tcgetattr(sys.stdin.fileno())
         tty.setcbreak(sys.stdin.fileno())
 
@@ -789,21 +925,22 @@ class Screen:
             if self.tui:
                 self._draw()
 
-    def set_input(self, text):
-        """text=None — закрыть строку ввода."""
+    def set_input(self, text, full=False):
+        """text=None — close the input line."""
         with self.lock:
             self.input = text
+            self.input_full = full
             if self.tui:
                 self._draw()
 
     def _draw(self):
         self._apply_resize()
         if self.input is not None:
-            line = "> " + self.input
+            line = ("?> " if self.input_full else "> ") + self.input
             if len(line) > self.w - 1:
                 line = line[-(self.w - 1):]
             sys.stdout.write(f"\x1b[{self.h};1H\x1b[2K\x1b[1;35m{line}\x1b[0m\x1b[?25h")
-            sys.stdout.flush()      # курсор оставляем в конце ввода
+            sys.stdout.flush()      # leave the cursor at the end of the input
             return
         s = self.status[: self.w]
         sys.stdout.write(f"\x1b[?25l\x1b[{self.h};1H\x1b[2K\x1b[7m{s.ljust(self.w)}\x1b[0m")
@@ -822,21 +959,54 @@ class Screen:
             if self.old_term is not None:
                 termios.tcsetattr(sys.stdin.fileno(), termios.TCSADRAIN, self.old_term)
             if self.tui:
-                sys.stdout.write("\x1b[<u")     # вернуть обычный режим клавиатуры
+                sys.stdout.write("\x1b[<u")     # restore the normal keyboard mode
                 sys.stdout.write(f"\x1b[r\x1b[{self.h};1H\x1b[2K\x1b[?25h")
                 sys.stdout.flush()
 
 
 # ==========================================================================
-# Чтение клавиш
+# Key reading
 # ==========================================================================
 
-class KeyReader:
-    """Читает с файлового дескриптора напрямую.
+class WindowsKeyReader:
+    """Reads via msvcrt: select on Windows accepts sockets only, not stdin.
 
-    select() видит только fd, а sys.stdin.read(1) утаскивает весь доступный кусок
-    в буфер TextIOWrapper — после первого символа select молчит, и остаток
-    вставленной строки теряется. Поэтому свой буфер и инкрементальный декодер.
+    Windows Terminal cannot do the kitty keyboard protocol, so Shift+Enter here is
+    indistinguishable from a plain Enter — "the whole transcript" is selected with
+    the `?` key instead of `/` when opening the question line.
+    """
+
+    def key(self, timeout=0.3):
+        deadline = time.time() + timeout
+        while True:
+            if msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                if ch in ("\x00", "\xe0"):     # function key prefix
+                    msvcrt.getwch()             # eat the scan code and ignore it
+                    return None
+                if ch in ("\r", "\n"):
+                    return ("enter",)
+                if ch == "\x08":
+                    return ("backspace",)
+                if ch == "\x15":
+                    return ("clear",)
+                if ch == "\x1b":
+                    return ("esc",)
+                if ch == "\x03":
+                    return ("interrupt",)
+                return ("char", ch)
+            if time.time() >= deadline:
+                return None
+            time.sleep(0.01)
+
+
+class PosixKeyReader:
+    """Reads straight from the file descriptor.
+
+    select() only sees the fd, while sys.stdin.read(1) drags the whole available
+    chunk into the TextIOWrapper buffer — after the first character select stays
+    quiet and the rest of a pasted line is lost. Hence our own buffer and an
+    incremental decoder.
     """
 
     def __init__(self):
@@ -878,10 +1048,10 @@ class KeyReader:
             if not seq:
                 return ("esc",)
             if seq in ("\r", "\n"):
-                return ("shift_enter",)     # Alt+Enter — фолбэк без CSI-u
+                return ("shift_enter",)     # Alt+Enter — fallback without CSI-u
             if seq.startswith("[") and seq.endswith("u"):
                 parts = seq[1:-1].split(";")
-                if parts[0] == "13":        # Enter в kitty keyboard protocol
+                if parts[0] == "13":        # Enter in the kitty keyboard protocol
                     mod = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 1
                     return ("shift_enter",) if (mod - 1) & 1 else ("enter",)
             return None
@@ -889,13 +1059,18 @@ class KeyReader:
             return ("enter",)
         if ch in ("\x7f", "\b"):
             return ("backspace",)
-        if ch == "\x15":                   # Ctrl+U — стереть строку
+        if ch == "\x15":                   # Ctrl+U — clear the line
             return ("clear",)
+        if ch == "\x03":
+            return ("interrupt",)
         return ("char", ch)
 
 
+KeyReader = WindowsKeyReader if IS_WINDOWS else PosixKeyReader
+
+
 # ==========================================================================
-# Состояние сессии
+# Session state
 # ==========================================================================
 
 class State:
@@ -911,13 +1086,13 @@ class State:
         self.speaking = {"mic": False, "speaker": False}
         self.pending = 0
         self.asking = 0
-        self.transcript = []      # [(ts, src, text)] — контекст для Gemini
-        self.interim = ""         # текущая недоговорённая фраза в live-режиме
+        self.transcript = []      # [(ts, src, text)] — context for Gemini
+        self.interim = ""         # the current unfinished phrase in live mode
         self.started = time.time()
 
 
 # ==========================================================================
-# Основной прогон
+# Main run
 # ==========================================================================
 
 def run(args, backend, usage, out_path, gemini=None):
@@ -926,9 +1101,9 @@ def run(args, backend, usage, out_path, gemini=None):
     work = queue.Queue()
     sources = ["mic", "speaker"] if args.source == "both" else [args.source]
 
-    # Резолвим устройства до создания Screen: resolve_source может завершить
-    # программу через die(), а Screen к тому моменту уже спрятал бы курсор,
-    # сузил область прокрутки и включил kitty keyboard protocol.
+    # Resolve the devices before creating Screen: resolve_source may terminate the
+    # program via die(), and by then Screen would have already hidden the cursor,
+    # narrowed the scrolling region and enabled the kitty keyboard protocol.
     devices = {}
     if "mic" in sources:
         devices["mic"] = resolve_source("mic", args.mic_device)
@@ -938,8 +1113,8 @@ def run(args, backend, usage, out_path, gemini=None):
     screen = Screen(not args.no_tui)
     vads = {s: Vad(args.vad_threshold) for s in sources}
     prompts = {s: "" for s in sources}
-    # по writer'у на источник: Wave_write не потокобезопасен, а смешивать mic и
-    # speaker в один моно-поток бессмысленно — выйдет каша из двух говорящих
+    # one writer per source: Wave_write is not thread-safe, and mixing mic and
+    # speaker into a single mono stream is pointless — two speakers become mush
     dump = {"w": {}, "by_frame": bool(args.keep_audio)}
 
     def dump_path(src):
@@ -950,16 +1125,16 @@ def run(args, backend, usage, out_path, gemini=None):
     out = open(out_path, "a", encoding="utf-8", buffering=1)
 
     def wout(text):
-        """Фоновые потоки могут дописать уже после закрытия файла (например,
-        если запрос завис и join истёк по таймауту) — молча пропускаем."""
+        """Background threads may append after the file is already closed (for
+        example if a request hung and join timed out) — silently skip it."""
         if not out.closed:
             out.write(text)
 
-    out.write(f"# Транскрипция — {datetime.now():%Y-%m-%d %H:%M}\n")
+    out.write(f"# Transcript — {datetime.now():%Y-%m-%d %H:%M}\n")
     if args.backend == "gemini-live":
-        out.write(f"# Источник: {args.source} | движок: {args.live_model}\n\n")
+        out.write(f"# Source: {args.source} | engine: {args.live_model}\n\n")
     else:
-        out.write(f"# Источник: {args.source} | язык: {args.lang} | модель: {args.model}\n\n")
+        out.write(f"# Source: {args.source} | language: {args.lang} | model: {args.model}\n\n")
 
     def emit_chunk(src, audio):
         state.pending += 1
@@ -971,9 +1146,9 @@ def run(args, backend, usage, out_path, gemini=None):
     live = None
     if args.backend == "gemini-live":
         if gemini is None:
-            die("для --backend gemini-live нужен ключ Gemini")
+            die("--backend gemini-live needs a Gemini key")
         if args.source == "both":
-            die("--backend gemini-live работает с одним источником: -s mic или -s speaker")
+            die("--backend gemini-live works with one source: -s mic or -s speaker")
 
         def on_final(text):
             ts = datetime.now().strftime("%H:%M:%S")
@@ -1021,14 +1196,14 @@ def run(args, backend, usage, out_path, gemini=None):
             dump["w"][src] = w
         if reason:
             names = ", ".join(dump_path(x).name for x in sources)
-            screen.line(f"\x1b[33m!! {reason} — пишу сырое аудио в {names}, "
-                        f"расшифруешь потом: ./rt.py --file <файл>\x1b[0m")
+            screen.line(f"\x1b[33m!! {reason} — writing raw audio to {names}, "
+                        f"transcribe it later: ./rt.py --file <file>\x1b[0m")
 
     def gate(chunk_sec):
-        """'ok' — можно слать; 'quota' — суточный лимит выбран.
+        """'ok' — safe to send; 'quota' — the daily limit is used up.
 
-        Часовые лимиты просто пережидаем. Но если уже останавливаемся, ждём
-        не дольше минуты, чтобы Ctrl+C не подвисал — остаток уйдёт в wav.
+        Hourly limits are simply waited out. But if we are already stopping, wait
+        no longer than a minute so Ctrl+C does not hang — the rest goes to wav.
         """
         waited = 0.0
         while True:
@@ -1054,7 +1229,7 @@ def run(args, backend, usage, out_path, gemini=None):
                 if not args.no_quota_guard and gate(dur) == "quota":
                     if not state.quota_out:
                         state.quota_out = True
-                        start_audio_dump("лимит на сегодня выбран")
+                        start_audio_dump("today's limit is used up")
                     if not dump["by_frame"]:
                         w = dump["w"].get(src)
                         if w is not None:
@@ -1074,37 +1249,37 @@ def run(args, backend, usage, out_path, gemini=None):
                     state.lines += 1
             except Exception as e:
                 state.failed += 1
-                screen.line(f"\x1b[31m[!] чанк потерян: {e}\x1b[0m")
-                wout(f"[!! чанк {dur:.0f}с потерян: {e}]\n")
+                screen.line(f"\x1b[31m[!] chunk lost: {e}\x1b[0m")
+                wout(f"[!! chunk of {dur:.0f}s lost: {e}]\n")
             finally:
                 state.pending -= 1
                 work.task_done()
 
     def ask(question, full):
         if gemini is None:
-            screen.line("\x1b[31mGemini не настроен: положи ключ в "
+            screen.line("\x1b[31mGemini is not configured: put the key in "
                         "~/.config/transcribe/gemini_key\x1b[0m")
             return
         lines = list(state.transcript)
         if not full:
             lines = lines[-args.recent:]
         if not lines:
-            screen.line("\x1b[31mещё нечего спрашивать — расшифровка пустая\x1b[0m")
+            screen.line("\x1b[31mnothing to ask about yet — the transcript is empty\x1b[0m")
             return
-        scope = (f"вся расшифровка, {len(lines)} реплик" if full
-                 else f"последние {len(lines)} реплик")
+        scope = (f"whole transcript, {len(lines)} lines" if full
+                 else f"last {len(lines)} lines")
         ctx = "\n".join(
             f"[{ts}] " + (f"[{LABELS[sr]}] " if args.source == "both" else "") + tx
             for ts, sr, tx in lines)
         screen.line(f"\x1b[1;35m>>> [{scope}] {question}\x1b[0m")
-        wout(f"\n>>> ВОПРОС ({scope}): {question}\n")
+        wout(f"\n>>> QUESTION ({scope}): {question}\n")
 
         def do_ask():
             state.asking += 1
             try:
                 answer, model = gemini.ask(ctx, question)
             except Exception as e:
-                answer, model = f"(ошибка Gemini: {e})", "—"
+                answer, model = f"(Gemini error: {e})", "—"
             finally:
                 state.asking -= 1
             for ln in screen.wrap(answer):
@@ -1115,7 +1290,8 @@ def run(args, backend, usage, out_path, gemini=None):
         threading.Thread(target=do_ask, daemon=True).start()
 
     def keys():
-        buf = None                      # не None => набираем вопрос
+        buf = None                      # not None => typing a question
+        full_default = False            # scope picked by the opening key
         reader = KeyReader()
         while not stop.is_set():
             if not sys.stdin.isatty():
@@ -1125,6 +1301,11 @@ def run(args, backend, usage, out_path, gemini=None):
             if k is None:
                 continue
             kind = k[0]
+
+            if kind == "interrupt":     # Ctrl+C where the signal misses it
+                state.quit = True
+                stop.set()
+                continue
 
             if buf is None:
                 if kind != "char":
@@ -1137,41 +1318,46 @@ def run(args, backend, usage, out_path, gemini=None):
                     state.paused = not state.paused
                 elif ch in ("m", "M"):
                     ts = datetime.now().strftime("%H:%M:%S")
-                    screen.line(f"\x1b[1;36m─── метка {ts} ───\x1b[0m")
-                    out.write(f"\n=== МЕТКА {ts} ===\n\n")
+                    screen.line(f"\x1b[1;36m─── mark {ts} ───\x1b[0m")
+                    out.write(f"\n=== MARK {ts} ===\n\n")
                 elif ch in ("/", "?"):
+                    # `?` opens a question about the whole transcript right away:
+                    # on Windows Shift+Enter is the same as Enter, so we need another way
                     buf = ""
-                    screen.set_input(buf)
+                    full_default = (ch == "?")
+                    screen.set_input(buf, full_default)
                 continue
 
             if kind == "char":
                 buf += k[1]
-                screen.set_input(buf)
+                screen.set_input(buf, full_default)
             elif kind == "backspace":
                 buf = buf[:-1]
-                screen.set_input(buf)
+                screen.set_input(buf, full_default)
             elif kind == "clear":
                 buf = ""
-                screen.set_input(buf)
+                screen.set_input(buf, full_default)
             elif kind == "esc":
                 buf = None
                 screen.set_input(None)
             elif kind in ("enter", "shift_enter"):
                 question = buf.strip()
+                full = full_default or kind == "shift_enter"
                 buf = None
                 screen.set_input(None)
                 if question:
-                    ask(question, full=(kind == "shift_enter"))
+                    ask(question, full=full)
 
-    # запуск
+    # start
     if args.keep_audio:
         start_audio_dump()
 
     screen.raw_input_mode()
     for s in sources:
         screen.line(f"\x1b[90m{LABELS[s]}: {devices[s]}\x1b[0m")
-    screen.line(f"\x1b[90mпишу в {out_path}\x1b[0m")
-    hint = "space — пауза, m — метка, / — спросить Gemini, q — стоп"
+    screen.line(f"\x1b[90mwriting to {out_path}\x1b[0m")
+    hint = ("space — pause, m — mark, / — question about the recent lines, "
+            "? — about the whole transcript, q — stop")
     screen.line("\x1b[90m" + "─" * 3 + f" {hint} " + "─" * 3 + "\x1b[0m")
 
     caps = [Capture(s, devices[s], on_frame, stop, state) for s in sources]
@@ -1191,36 +1377,36 @@ def run(args, backend, usage, out_path, gemini=None):
             bar_src = sources[0]
             level = min(1.0, state.rms[bar_src] / 0.15)
             bar = "▁▂▃▄▅▆▇█"[min(7, int(level * 8))] * 3 if not state.paused else "···"
-            mark = "● ПАУЗА" if state.paused else ("● ГОВОРЯТ" if any(state.speaking.values()) else "○ тишина")
+            mark = "● PAUSED" if state.paused else ("● SPEECH" if any(state.speaking.values()) else "○ silence")
             buf = len(chunkers[bar_src].buf) * FRAME_MS / 1000
             if live is not None:
-                link = "live" if live.connected else "нет связи"
-                head = (f" {mark} {hms(el)} │ {bar} │ {link} · сессий {live.sessions} │ "
-                        f"строк {state.lines} │ ")
+                link = "live" if live.connected else "no link"
+                head = (f" {mark} {hms(el)} │ {bar} │ {link} · sessions {live.sessions} │ "
+                        f"lines {state.lines} │ ")
                 tail = state.interim.replace("\n", " ")
                 room = max(0, screen.w - len(head) - 2)
                 screen.set_status(head + ("…" + tail[-room + 1:] if len(tail) > room else tail))
             else:
                 screen.set_status(
-                    f" {mark} {hms(el)} │ {bar} │ буфер {buf:4.1f}с │ очередь {state.pending} │ "
-                    f"строк {state.lines} │ сегодня {st['req_day']}/{LIMIT_RPD} зап · "
-                    f"{compact(st['sec_day'])}/{compact(LIMIT_ASD)} аудио"
+                    f" {mark} {hms(el)} │ {bar} │ buf {buf:4.1f}s │ queue {state.pending} │ "
+                    f"lines {state.lines} │ today {st['req_day']}/{LIMIT_RPD} req · "
+                    f"{compact(st['sec_day'])}/{compact(LIMIT_ASD)} audio"
                     + (f" │ \u2726 Gemini…" if state.asking else "")
-                    + ("  ЛИМИТ ИСЧЕРПАН" if state.quota_out else "")
+                    + ("  QUOTA EXHAUSTED" if state.quota_out else "")
                 )
             time.sleep(0.25)
     except KeyboardInterrupt:
         pass
-    except Exception as e:                  # иначе улетим мимо screen.close()
-        state.fatal = f"сбой интерфейса: {e}"
+    except Exception as e:                  # otherwise we would fly past screen.close()
+        state.fatal = f"UI failure: {e}"
     finally:
         stop.set()
 
-    screen.set_status(" останавливаюсь, дорабатываю очередь…")
+    screen.set_status(" stopping, finishing the queue…")
     if live is not None:
         live.stop.set()
         live.join(timeout=60)
-    for c in caps:              # иначе feed() из захвата гонится с flush()
+    for c in caps:              # otherwise feed() from capture races with flush()
         c.join(timeout=3)
     for c in chunkers.values():
         c.flush()
@@ -1229,28 +1415,28 @@ def run(args, backend, usage, out_path, gemini=None):
 
     for w in dump["w"].values():
         w.close()
-    out.write(f"\n# конец, {hms(time.time() - state.started)}\n")
+    out.write(f"\n# end, {hms(time.time() - state.started)}\n")
     out.close()
     screen.close()
 
-    print(f"\nСохранено: {out_path}")
-    print(f"Строк: {state.lines} | запросов: {state.sent} | потеряно чанков: {state.failed}")
+    print(f"\nSaved: {out_path}")
+    print(f"Lines: {state.lines} | requests: {state.sent} | chunks lost: {state.failed}")
     for src in dump["w"]:
-        print(f"Сырое аудио: {dump_path(src)}")
+        print(f"Raw audio: {dump_path(src)}")
     if state.fatal:
-        print(f"\nОшибка: {state.fatal}", file=sys.stderr)
+        print(f"\nError: {state.fatal}", file=sys.stderr)
     print_quota(usage)
 
 
 # ==========================================================================
-# Пакетный режим: расшифровать готовый файл тем же конвейером
+# Batch mode: transcribe an existing file through the same pipeline
 # ==========================================================================
 
 def run_file(args, backend, usage, src_path, out_path):
     if not src_path.exists():
-        die(f"нет файла {src_path}")
-    # stderr во временный файл, а не в трубу: её никто не вычитывает до конца
-    # разбора stdout, и на шумном ffmpeg 64КБ буфера хватило бы для взаимной блокировки
+        die(f"no such file: {src_path}")
+    # stderr into a temp file rather than a pipe: nobody reads the pipe until stdout
+    # is fully parsed, and with a noisy ffmpeg a 64KB buffer would be enough to deadlock
     errf = tempfile.TemporaryFile()
     proc = subprocess.Popen(
         ["ffmpeg", "-v", "error", "-i", str(src_path), "-ac", "1",
@@ -1262,8 +1448,8 @@ def run_file(args, backend, usage, src_path, out_path):
     ck = Chunker("file", args.min_chunk, args.max_chunk, args.silence,
                  lambda _s, a: pending.append(a))
     out = open(out_path, "a", encoding="utf-8", buffering=1)
-    out.write(f"# Транскрипция файла {src_path.name} — {datetime.now():%Y-%m-%d %H:%M}\n")
-    out.write(f"# язык: {args.lang} | модель: {args.model}\n\n")
+    out.write(f"# Transcript of {src_path.name} — {datetime.now():%Y-%m-%d %H:%M}\n")
+    out.write(f"# language: {args.lang} | model: {args.model}\n\n")
 
     prompt = ""
     pos = 0.0
@@ -1278,9 +1464,9 @@ def run_file(args, backend, usage, src_path, out_path):
                 while True:
                     st = usage.stats()
                     if st["req_day"] >= LIMIT_RPD or st["sec_day"] + dur > LIMIT_ASD:
-                        die("суточный лимит выбран — продолжишь завтра, файл дописан")
+                        die("daily limit used up — continue tomorrow, the file is saved")
                     if st["rpm"] >= LIMIT_RPM - 1 or st["sec_hour"] + dur > LIMIT_ASH:
-                        print(f"\r  ждём слот под лимиты… ({hms(pos)})", end="", flush=True)
+                        print(f"\r  waiting for a quota slot… ({hms(pos)})", end="", flush=True)
                         time.sleep(3)
                         continue
                     break
@@ -1294,11 +1480,11 @@ def run_file(args, backend, usage, src_path, out_path):
                     lines += 1
             except Exception as e:
                 failed += 1
-                out.write(f"[!! кусок на {hms(pos - dur)} потерян: {e}]\n")
-            print(f"\r  {hms(pos)} | кусков {sent} | строк {lines}"
-                  + (f" | потеряно {failed}" if failed else "") + "   ", end="", flush=True)
+                out.write(f"[!! chunk at {hms(pos - dur)} lost: {e}]\n")
+            print(f"\r  {hms(pos)} | chunks {sent} | lines {lines}"
+                  + (f" | lost {failed}" if failed else "") + "   ", end="", flush=True)
 
-    print(f"Расшифровываю {src_path.name} -> {out_path}")
+    print(f"Transcribing {src_path.name} -> {out_path}")
     while True:
         data = proc.stdout.read(FRAME_BYTES)
         if not data or len(data) < FRAME_BYTES:
@@ -1317,10 +1503,10 @@ def run_file(args, backend, usage, src_path, out_path):
     if proc.returncode != 0 and err:
         print(f"\nffmpeg: {err[:300]}", file=sys.stderr)
 
-    out.write(f"\n# конец, {hms(pos)} аудио\n")
+    out.write(f"\n# end, {hms(pos)} of audio\n")
     out.close()
-    print(f"\n\nСохранено: {out_path}")
-    print(f"Строк: {lines} | запросов: {sent} | потеряно кусков: {failed}")
+    print(f"\n\nSaved: {out_path}")
+    print(f"Lines: {lines} | requests: {sent} | chunks lost: {failed}")
     print_quota(usage)
 
 
@@ -1342,59 +1528,59 @@ def read_key(cli_key, env_name, filename):
 def find_key(cli_key):
     k = read_key(cli_key, "GROQ_API_KEY", "key")
     if not k:
-        die("нет ключа: положи в $GROQ_API_KEY, в ~/.config/transcribe/key или передай --api-key")
+        die("no key: put it in $GROQ_API_KEY, in ~/.config/transcribe/key or pass --api-key")
     return k
 
 
 def build_parser():
     p = argparse.ArgumentParser(
-        description="Realtime-транскрипция лекций через Groq Whisper",
+        description="Realtime lecture transcription via Groq Whisper",
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     p.add_argument("-s", "--source", default="speaker", choices=["mic", "speaker", "both"],
-                   help="источник звука (по умолчанию speaker — системный звук)")
-    p.add_argument("-l", "--lang", default="uk", help="код языка или auto (по умолчанию uk)")
+                   help="audio source (default speaker — system audio)")
+    p.add_argument("-l", "--lang", default="auto", help="language code or auto (default auto)")
     p.add_argument("-m", "--model", default="turbo", choices=list(MODELS),
-                   help="turbo — быстрее и дешевле, large — точнее")
-    p.add_argument("-o", "--out", metavar="FILE", help="файл расшифровки")
-    p.add_argument("--min-chunk", type=float, default=15, metavar="СЕК",
-                   help="минимальная длина куска (по умолчанию 15)")
-    p.add_argument("--max-chunk", type=float, default=30, metavar="СЕК",
-                   help="жёсткий предел куска (по умолчанию 30)")
-    p.add_argument("--silence", type=float, default=0.5, metavar="СЕК",
-                   help="пауза, по которой режем (по умолчанию 0.5)")
+                   help="turbo — faster and cheaper, large — more accurate")
+    p.add_argument("-o", "--out", metavar="FILE", help="transcript file")
+    p.add_argument("--min-chunk", type=float, default=15, metavar="SEC",
+                   help="minimum chunk length (default 15)")
+    p.add_argument("--max-chunk", type=float, default=30, metavar="SEC",
+                   help="hard chunk limit (default 30)")
+    p.add_argument("--silence", type=float, default=0.5, metavar="SEC",
+                   help="pause length to cut on (default 0.5)")
     p.add_argument("--vad-threshold", type=float, default=None, metavar="RMS",
-                   help="фиксированный порог VAD вместо адаптивного (напр. 0.004)")
-    p.add_argument("--mic-device", metavar="ИМЯ", help="часть имени микрофона")
-    p.add_argument("--speaker-device", metavar="ИМЯ", help="часть имени монитора вывода")
+                   help="fixed VAD threshold instead of the adaptive one (e.g. 0.004)")
+    p.add_argument("--mic-device", metavar="NAME", help="part of the microphone name")
+    p.add_argument("--speaker-device", metavar="NAME", help="part of the output monitor name")
     p.add_argument("--backend", default="groq", choices=["groq", "local", "gemini-live"],
-                   help="gemini-live — непрерывный поток в Gemini Live API (лимитов по "
-                        "числу запросов нет); local — оффлайн через faster-whisper")
+                   help="gemini-live — a continuous stream to the Gemini Live API (no "
+                        "request-count limits); local — offline via faster-whisper")
     p.add_argument("--live-model", default="gemini-3.5-transcribe-live",
-                   help="модель для --backend gemini-live")
-    p.add_argument("--live-silence", type=int, default=800, metavar="МС",
-                   help="пауза, по которой Live API отбивает фразу (по умолчанию 800)")
-    p.add_argument("--live-flush", type=int, default=90, metavar="СЕК",
-                   help="если финала нет дольше этого, пересоздать сессию (по умолчанию 90)")
-    p.add_argument("--local-model", default="large-v3", help="модель для --backend local")
-    p.add_argument("--api-key", help="ключ Groq (иначе $GROQ_API_KEY)")
+                   help="model for --backend gemini-live")
+    p.add_argument("--live-silence", type=int, default=800, metavar="MS",
+                   help="pause after which the Live API ends a phrase (default 800)")
+    p.add_argument("--live-flush", type=int, default=90, metavar="SEC",
+                   help="recreate the session if there is no final for longer (default 90)")
+    p.add_argument("--local-model", default="large-v3", help="model for --backend local")
+    p.add_argument("--api-key", help="Groq key (otherwise $GROQ_API_KEY)")
     p.add_argument("--keep-audio", action="store_true", default=None,
-                   help="писать рядом сырой wav (иначе только при исчерпании лимита)")
+                   help="also write a raw wav (otherwise only when the quota runs out)")
     p.add_argument("--no-quota-guard", action="store_true",
-                   help="не притормаживать под free-tier лимиты (для платного тарифа)")
-    p.add_argument("--no-tui", action="store_true", help="простой построчный вывод, без статус-бара")
-    p.add_argument("--list-devices", action="store_true", help="показать устройства и выйти")
-    p.add_argument("--quota", action="store_true", help="показать расход лимитов и выйти")
+                   help="do not throttle for free-tier limits (for a paid plan)")
+    p.add_argument("--no-tui", action="store_true", help="plain line-by-line output, no status bar")
+    p.add_argument("--list-devices", action="store_true", help="list the devices and exit")
+    p.add_argument("--quota", action="store_true", help="show quota usage and exit")
     p.add_argument("--recent", type=int, default=8, metavar="N",
-                   help="сколько последних реплик берёт Enter в вопросе (по умолчанию 8)")
-    p.add_argument("--gemini-model", metavar="МОДЕЛЬ",
-                   help="жёстко закрепить одну модель вместо цепочки фолбэка "
-                        "(напр. gemini-3.5-flash-lite — самая быстрая)")
+                   help="how many recent lines Enter picks up for a question (default 8)")
+    p.add_argument("--gemini-model", metavar="MODEL",
+                   help="pin a single model instead of the fallback chain "
+                        "(e.g. gemini-3.5-flash-lite — the fastest one)")
     p.add_argument("--thinking", default="low", choices=["low", "medium", "high"],
-                   help="глубина рассуждений Gemini (по умолчанию low — ради скорости)")
-    p.add_argument("--gemini-key", help="ключ Gemini (иначе $GEMINI_API_KEY)")
-    p.add_argument("--file", metavar="ФАЙЛ",
-                   help="не писать с устройства, а расшифровать готовый файл "
-                        "(любой формат, который читает ffmpeg)")
+                   help="Gemini reasoning depth (default low — for speed)")
+    p.add_argument("--gemini-key", help="Gemini key (otherwise $GEMINI_API_KEY)")
+    p.add_argument("--file", metavar="FILE",
+                   help="do not record from a device, transcribe an existing file "
+                        "(any format ffmpeg can read)")
     return p
 
 
@@ -1411,17 +1597,17 @@ def main():
         return
 
     if args.min_chunk < MIN_BILLED:
-        print(f"warning: куски короче {MIN_BILLED}с всё равно тарифицируются как {MIN_BILLED}с",
+        print(f"warning: chunks shorter than {MIN_BILLED}s are still billed as {MIN_BILLED}s",
               file=sys.stderr)
     if args.source == "both":
-        print("warning: режим both шлёт два потока — лимиты тратятся вдвое быстрее",
+        print("warning: mode both sends two streams — the limits run out twice as fast",
               file=sys.stderr)
 
     if args.backend == "local":
         backend = LocalBackend(args.local_model, args.lang)
     elif args.backend == "gemini-live":
         if args.file:
-            die("--backend gemini-live только для живого захвата, для файлов используй groq")
+            die("--backend gemini-live is for live capture only, use groq for files")
         backend = None
     else:
         backend = GroqBackend(find_key(args.api_key), args.model, args.lang)
@@ -1440,7 +1626,7 @@ def main():
     chain = [(args.gemini_model, 0)] if args.gemini_model else GEMINI_CHAIN
     gemini = Gemini(gkey, chain, args.thinking) if gkey else None
     if gemini is None:
-        print("note: ключа Gemini нет — вопросы по расшифровке ('/') будут недоступны",
+        print("note: no Gemini key — questions about the transcript ('/') are unavailable",
               file=sys.stderr)
     run(args, backend, usage, out_path, gemini)
 

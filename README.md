@@ -4,10 +4,11 @@ Live speech-to-text for lectures and meetings, straight into a text file, with a
 terminal UI you can ask questions in. Captures either your microphone or the
 system audio (Zoom, browser, anything playing through your speakers).
 
-Two transcription backends:
+Three transcription backends:
 
 - **Groq Whisper** — audio is cut into chunks on silence and sent over HTTP.
 - **Gemini Live API** — a continuous WebSocket stream, no per-request limits.
+- **faster-whisper** — optional offline transcription on your GPU or CPU.
 
 While it runs you can hit `/` and ask a question about what has been said so far.
 The answer is written into the same transcript, clearly marked.
@@ -18,14 +19,16 @@ The answer is written into the same transcript, clearly marked.
 
 ## Requirements
 
-- Linux with PipeWire or PulseAudio (`parec`, `pactl` — from `pipewire-pulse` or `libpulse`)
 - Python 3.10+
+- Linux: PipeWire or PulseAudio (`parec`, `pactl` — from `pipewire-pulse` or `libpulse`)
+- Windows: nothing extra beyond `pip install -r requirements.txt`, which pulls in
+  `PyAudioWPatch` for microphone and WASAPI loopback capture
 - `ffmpeg` for `--file` mode
 - `pip install -r requirements.txt`
 
 ## Setup
 
-Keys go in `~/.config/transcribe/` (or the matching environment variables):
+For Linux and macOS, keys can go in `~/.config/transcribe/`:
 
 ```sh
 mkdir -p ~/.config/transcribe
@@ -34,20 +37,43 @@ printf '%s' 'AIza...'  > ~/.config/transcribe/gemini_key  # Gemini, or $GEMINI_A
 chmod 600 ~/.config/transcribe/*
 ```
 
+On Windows, put the same two files in `%APPDATA%\transcribe`:
+
+```powershell
+$keyDir = Join-Path $env:APPDATA "transcribe"
+New-Item -ItemType Directory -Force $keyDir | Out-Null
+Set-Content (Join-Path $keyDir "key") "gsk_..." -NoNewline
+Set-Content (Join-Path $keyDir "gemini_key") "AIza..." -NoNewline
+```
+
+Alternatively, set `GROQ_API_KEY` and `GEMINI_API_KEY` environment variables on
+any platform, or pass `--api-key` and `--gemini-key` for a single run. Do not
+commit real keys to this repository.
+
 The Gemini key is optional for the Groq backend — it only powers the question
 feature. It is required for `--backend gemini-live`.
+
+The offline backend is optional and requires `faster-whisper` separately:
+
+```sh
+pip install faster-whisper
+```
 
 ## Usage
 
 ```sh
 ./rt.py                                  # system audio via Groq
 ./rt.py --backend gemini-live            # system audio via Gemini Live
+./rt.py --backend local                  # offline via faster-whisper
 ./rt.py -s mic -l uk                     # microphone, pinned to Ukrainian
 ./rt.py -s both                          # mic + speakers, lines tagged [mic]/[spk]
 ./rt.py --file lecture.mp4               # transcribe an existing recording
 ./rt.py --list-devices
 ./rt.py --quota                          # how much of today's free tier is left
 ```
+
+The spoken language is detected automatically by default. Pass `-l uk`, `-l ru`,
+or another language code when you want to pin it explicitly.
 
 Transcripts land in `~/Documents/transcripts/` unless you pass `-o`. They are
 written line by line and flushed immediately, so a crash costs you nothing.
@@ -58,15 +84,14 @@ written line by line and flushed immediately, so a crash costs you nothing.
 |---|---|
 | `space` | pause / resume capture |
 | `m` | drop a marker at the current timestamp |
-| `/` | ask Gemini about the transcript |
+| `/` | ask about the **last N lines** (`--recent`, default 8) |
+| `?` | ask about the **entire transcript** |
 | `q` | stop and save |
 
-Inside the question prompt: `Enter` sends the last N lines as context
-(`--recent`, default 8), `Shift+Enter` sends the entire transcript, `Esc`
-cancels, `Ctrl+U` clears.
-
-`Shift+Enter` needs a terminal that speaks the kitty keyboard protocol (Ghostty,
-kitty, foot, WezTerm). Everywhere else use `Alt+Enter`, which does the same thing.
+Inside the question prompt: `Enter` sends, `Esc` cancels, `Ctrl+U` clears the
+line. `Shift+Enter` also forces whole-transcript scope, but that needs a terminal
+speaking the kitty keyboard protocol (Ghostty, kitty, foot, WezTerm) — Windows
+Terminal cannot distinguish it from plain `Enter`, which is why `?` exists.
 
 ## Choosing a backend
 
@@ -117,10 +142,11 @@ upload volume by about three quarters.
 `prompt` parameter so terminology and names stay consistent across a boundary.
 
 **Quota accounting that survives restarts.** Usage is journalled to
-`~/.local/state/transcribe/usage.json` with rolling hour and day windows. Before
-each request the client waits for a free slot instead of eating a 429. If the
-daily allowance really is gone, it starts writing raw audio to a `.wav` next to
-the transcript so you can finish the job later with `--file`.
+`~/.local/state/transcribe/usage.json` on Linux/macOS and
+`%LOCALAPPDATA%\transcribe\usage.json` on Windows, with rolling hour and day
+windows. Before each request the client waits for a free slot instead of eating
+a 429. If the daily allowance really is gone, it starts writing raw audio to a
+`.wav` next to the transcript so you can finish the job later with `--file`.
 
 **Session rotation (Live backend).** The Live model emits interim transcripts
 that accumulate and get revised in place, and commits a final one only at an
@@ -133,15 +159,25 @@ by comparing a rotated run against an unrotated one — identical character coun
 
 | | status |
 |---|---|
-| Linux (PipeWire / PulseAudio) | works, this is what it was built and tested on |
-| Windows | not yet — see below |
-| macOS | untested; capture would need the same work as Windows |
+| Linux (PipeWire / PulseAudio) | works; built and regression-tested here |
+| Windows | device enumeration and system-audio capture smoke-tested on real hardware |
+| macOS | untested; would need a capture backend of its own |
 
-About 13% of the code is platform-specific: device enumeration via `pactl`,
-capture via `parec`, raw keyboard reads, and `termios`/`SIGWINCH`. The other 87%
-— VAD, chunking, quota accounting, both API clients, the TUI — is portable.
-Windows support is being developed on the `windows-support` branch rather than as
-a permanent fork, so bug fixes never have to be applied twice.
+Roughly 13% of the code is platform-specific and it is isolated at three seams —
+device enumeration, audio capture, and raw keyboard reads — each with a `Posix*`
+and a `Windows*` implementation picked at import time. The other 87% (VAD,
+chunking, quota accounting, both API clients, the TUI) is shared, which is
+exactly why this is one branch and not a permanent fork: a fix in shared code
+would otherwise have to be applied twice.
+
+Windows uses `PyAudioWPatch` for microphone and WASAPI loopback capture,
+`msvcrt` for keystrokes, and
+`%APPDATA%` / `%LOCALAPPDATA%` for config and state. Terminal resize is polled
+rather than signalled, so `SIGWINCH` is gone from both platforms.
+
+**The Windows path has been smoke-tested on real hardware.** Device enumeration
+and system-audio loopback capture work; microphone support depends on the active
+Windows endpoint and its driver. Expect rough edges; issue reports welcome.
 
 ## Repository layout
 
