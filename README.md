@@ -4,10 +4,11 @@ Live speech-to-text for lectures and meetings, straight into a text file, with a
 terminal UI you can ask questions in. Captures either your microphone or the
 system audio (Zoom, browser, anything playing through your speakers).
 
-Two transcription backends:
+Three transcription backends:
 
 - **Groq Whisper** — audio is cut into chunks on silence and sent over HTTP.
 - **Gemini Live API** — a continuous WebSocket stream, no per-request limits.
+- **faster-whisper** — optional offline transcription on your GPU or CPU.
 
 While it runs you can hit `/` and ask a question about what has been said so far.
 The answer is written into the same transcript, clearly marked.
@@ -27,7 +28,7 @@ The answer is written into the same transcript, clearly marked.
 
 ## Setup
 
-Keys go in `~/.config/transcribe/` (or the matching environment variables):
+For Linux and macOS, keys can go in `~/.config/transcribe/`:
 
 ```sh
 mkdir -p ~/.config/transcribe
@@ -36,14 +37,34 @@ printf '%s' 'AIza...'  > ~/.config/transcribe/gemini_key  # Gemini, or $GEMINI_A
 chmod 600 ~/.config/transcribe/*
 ```
 
+On Windows, put the same two files in `%APPDATA%\transcribe`:
+
+```powershell
+$keyDir = Join-Path $env:APPDATA "transcribe"
+New-Item -ItemType Directory -Force $keyDir | Out-Null
+Set-Content (Join-Path $keyDir "key") "gsk_..." -NoNewline
+Set-Content (Join-Path $keyDir "gemini_key") "AIza..." -NoNewline
+```
+
+Alternatively, set `GROQ_API_KEY` and `GEMINI_API_KEY` environment variables on
+any platform, or pass `--api-key` and `--gemini-key` for a single run. Do not
+commit real keys to this repository.
+
 The Gemini key is optional for the Groq backend — it only powers the question
 feature. It is required for `--backend gemini-live`.
+
+The offline backend is optional and requires `faster-whisper` separately:
+
+```sh
+pip install faster-whisper
+```
 
 ## Usage
 
 ```sh
 ./rt.py                                  # system audio via Groq
 ./rt.py --backend gemini-live            # system audio via Gemini Live
+./rt.py --backend local                  # offline via faster-whisper
 ./rt.py -s mic -l uk                     # microphone, pinned to Ukrainian
 ./rt.py -s both                          # mic + speakers, lines tagged [mic]/[spk]
 ./rt.py --file lecture.mp4               # transcribe an existing recording
@@ -118,10 +139,11 @@ upload volume by about three quarters.
 `prompt` parameter so terminology and names stay consistent across a boundary.
 
 **Quota accounting that survives restarts.** Usage is journalled to
-`~/.local/state/transcribe/usage.json` with rolling hour and day windows. Before
-each request the client waits for a free slot instead of eating a 429. If the
-daily allowance really is gone, it starts writing raw audio to a `.wav` next to
-the transcript so you can finish the job later with `--file`.
+`~/.local/state/transcribe/usage.json` on Linux/macOS and
+`%LOCALAPPDATA%\transcribe\usage.json` on Windows, with rolling hour and day
+windows. Before each request the client waits for a free slot instead of eating
+a 429. If the daily allowance really is gone, it starts writing raw audio to a
+`.wav` next to the transcript so you can finish the job later with `--file`.
 
 **Session rotation (Live backend).** The Live model emits interim transcripts
 that accumulate and get revised in place, and commits a final one only at an
