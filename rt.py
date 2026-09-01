@@ -130,35 +130,58 @@ def pactl(*args):
         return ""
 
 
-def _win_sc():
-    """soundcard is imported lazily: it is not needed on Linux."""
+def _win_pa():
+    """PyAudioWPatch is imported lazily: it is not needed on Linux."""
     try:
-        import soundcard
-        return soundcard
+        import pyaudiowpatch
+        return pyaudiowpatch
     except ImportError:
-        die("on Windows the soundcard package is required: pip install soundcard")
+        die("on Windows PyAudioWPatch is required: pip install PyAudioWPatch")
+
+
+def _win_device_id(index):
+    return f"wasapi:{index}"
+
+
+def _win_device_index(device):
+    try:
+        prefix, index = device.split(":", 1)
+        if prefix != "wasapi":
+            raise ValueError
+        return int(index)
+    except (AttributeError, TypeError, ValueError):
+        raise ValueError(f"invalid WASAPI device id: {device!r}") from None
 
 
 def _win_sources():
-    sc = _win_sc()
+    pa = _win_pa()
     out = []
-    for m in sc.all_microphones(include_loopback=False):
-        out.append((m.id, m.name, False))
-    for sp in sc.all_speakers():
-        out.append((sp.id, f"Monitor of {sp.name}", True))
+    with pa.PyAudio() as audio:
+        host = audio.get_host_api_info_by_type(pa.paWASAPI)
+        for index in range(audio.get_device_count()):
+            d = audio.get_device_info_by_index(index)
+            if d["hostApi"] != host["index"] or d.get("maxInputChannels", 0) <= 0:
+                continue
+            is_loopback = bool(d.get("isLoopbackDevice"))
+            desc = f"Monitor of {d['name'].removesuffix(' [Loopback]')}" if is_loopback else d["name"]
+            out.append((_win_device_id(index), desc, is_loopback))
     return out
 
 
 def _win_default_mic():
     try:
-        return _win_sc().default_microphone().id
+        pa = _win_pa()
+        with pa.PyAudio() as audio:
+            return _win_device_id(audio.get_default_wasapi_device(d_in=True)["index"])
     except Exception:
         return None
 
 
 def _win_default_monitor():
     try:
-        return _win_sc().default_speaker().id
+        pa = _win_pa()
+        with pa.PyAudio() as audio:
+            return _win_device_id(audio.get_default_wasapi_loopback()["index"])
     except Exception:
         return None
 
@@ -408,31 +431,50 @@ class Chunker:
 # ==========================================================================
 
 class WindowsCapture(threading.Thread):
-    """Capture via WASAPI (soundcard). System audio — loopback of the output device."""
+    """Capture microphones and output loopbacks through WASAPI via PyAudioWPatch."""
 
     def __init__(self, src, device, sink, stop, state):
         super().__init__(daemon=True)
         self.src, self.device, self.sink, self.stop, self.state = src, device, sink, stop, state
 
     def run(self):
-        sc = _win_sc()
+        pa = _win_pa()
         try:
-            mic = sc.get_microphone(self.device, include_loopback=(self.src == "speaker"))
+            audio = pa.PyAudio()
+            index = _win_device_index(self.device)
+            info = audio.get_device_info_by_index(index)
+            rate = int(info["defaultSampleRate"])
+            channels = min(2, int(info["maxInputChannels"]))
+            native_frames = round(rate * FRAME_MS / 1000)
+            stream = audio.open(format=pa.paFloat32, channels=channels, rate=rate,
+                                input=True, input_device_index=index,
+                                frames_per_buffer=native_frames)
         except Exception as e:
-            self.state.fatal = f"device {self.device!r} failed to open: {e}"
+            if "audio" in locals():
+                audio.terminate()
+            self.state.fatal = f"device {self.device!r} failed to open: {type(e).__name__}: {e!r}"
             self.stop.set()
             return
         try:
-            with mic.recorder(samplerate=SAMPLE_RATE, channels=1,
-                              blocksize=FRAME_SAMPLES) as rec:
-                while not self.stop.is_set():
-                    data = rec.record(numframes=FRAME_SAMPLES)
-                    frame = data[:, 0] if getattr(data, "ndim", 1) > 1 else data
-                    self.sink(self.src, np.ascontiguousarray(frame, dtype=np.float32))
+            while not self.stop.is_set():
+                raw = stream.read(native_frames, exception_on_overflow=False)
+                data = np.frombuffer(raw, dtype=np.float32).reshape(-1, channels)
+                frame = data.mean(axis=1)
+                if len(frame) != FRAME_SAMPLES:
+                    if len(frame) % FRAME_SAMPLES == 0:
+                        frame = frame.reshape(FRAME_SAMPLES, -1).mean(axis=1)
+                    else:
+                        x = np.linspace(0, len(frame) - 1, FRAME_SAMPLES)
+                        frame = np.interp(x, np.arange(len(frame)), frame)
+                self.sink(self.src, np.ascontiguousarray(frame, dtype=np.float32))
         except Exception as e:
             if not self.stop.is_set():
-                self.state.fatal = f"stream {self.src} died: {e}"
+                self.state.fatal = f"stream {self.src} died: {type(e).__name__}: {e!r}"
                 self.stop.set()
+        finally:
+            stream.stop_stream()
+            stream.close()
+            audio.terminate()
 
 
 class PosixCapture(threading.Thread):

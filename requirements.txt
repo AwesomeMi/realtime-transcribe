@@ -1,4 +1,4 @@
 numpy>=1.24
 requests>=2.31
 websockets>=12.0                          # only for --backend gemini-live
-soundcard>=0.4.3 ; sys_platform == "win32"  # WASAPI capture on Windows
+PyAudioWPatch>=0.2.12.8 ; sys_platform == "win32"  # WASAPI capture on Windows

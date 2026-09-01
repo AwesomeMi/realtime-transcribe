@@ -22,7 +22,7 @@ The answer is written into the same transcript, clearly marked.
 - Python 3.10+
 - Linux: PipeWire or PulseAudio (`parec`, `pactl` — from `pipewire-pulse` or `libpulse`)
 - Windows: nothing extra beyond `pip install -r requirements.txt`, which pulls in
-  `soundcard` for WASAPI loopback capture
+  `PyAudioWPatch` for microphone and WASAPI loopback capture
 - `ffmpeg` for `--file` mode
 - `pip install -r requirements.txt`
 
@@ -157,7 +157,7 @@ by comparing a rotated run against an unrotated one — identical character coun
 | | status |
 |---|---|
 | Linux (PipeWire / PulseAudio) | works; built and regression-tested here |
-| Windows | code is in place but **not yet run by anyone** — see below |
+| Windows | device enumeration and system-audio capture smoke-tested on real hardware |
 | macOS | untested; would need a capture backend of its own |
 
 Roughly 13% of the code is platform-specific and it is isolated at three seams —
@@ -167,13 +167,14 @@ chunking, quota accounting, both API clients, the TUI) is shared, which is
 exactly why this is one branch and not a permanent fork: a fix in shared code
 would otherwise have to be applied twice.
 
-Windows uses `soundcard` for WASAPI loopback, `msvcrt` for keystrokes, and
+Windows uses `PyAudioWPatch` for microphone and WASAPI loopback capture,
+`msvcrt` for keystrokes, and
 `%APPDATA%` / `%LOCALAPPDATA%` for config and state. Terminal resize is polled
 rather than signalled, so `SIGWINCH` is gone from both platforms.
 
-**The Windows path has never been executed.** It was written against the API docs
-and a previously working WASAPI prototype, and verified only statically. Expect
-rough edges; issue reports welcome.
+**The Windows path has been smoke-tested on real hardware.** Device enumeration
+and system-audio loopback capture work; microphone support depends on the active
+Windows endpoint and its driver. Expect rough edges; issue reports welcome.
 
 ## Repository layout
 
