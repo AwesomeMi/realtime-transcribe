@@ -72,6 +72,9 @@ pip install faster-whisper
 ./rt.py --quota                          # how much of today's free tier is left
 ```
 
+The spoken language is detected automatically by default. Pass `-l uk`, `-l ru`,
+or another language code when you want to pin it explicitly.
+
 Transcripts land in `~/Documents/transcripts/` unless you pass `-o`. They are
 written line by line and flushed immediately, so a crash costs you nothing.
 

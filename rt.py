@@ -1538,7 +1538,7 @@ def build_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     p.add_argument("-s", "--source", default="speaker", choices=["mic", "speaker", "both"],
                    help="audio source (default speaker — system audio)")
-    p.add_argument("-l", "--lang", default="uk", help="language code or auto (default uk)")
+    p.add_argument("-l", "--lang", default="auto", help="language code or auto (default auto)")
     p.add_argument("-m", "--model", default="turbo", choices=list(MODELS),
                    help="turbo — faster and cheaper, large — more accurate")
     p.add_argument("-o", "--out", metavar="FILE", help="transcript file")
