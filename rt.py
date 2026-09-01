@@ -10,10 +10,11 @@ Realtime-транскрипция через Groq Whisper API. Захват — 
 
 Горячие клавиши:
   space — пауза, m — метка, q — стоп и сохранить
-  /     — спросить Gemini по расшифровке:
-            Enter       — контекст из последних N реплик (--recent, по умолчанию 8)
-            Shift+Enter — контекст из всей расшифровки
-            Esc         — отменить ввод
+  /     — вопрос к Gemini по последним N репликам (--recent, по умолчанию 8)
+  ?     — вопрос по всей расшифровке
+            Shift+Enter — тоже «по всей» (нужен kitty keyboard protocol;
+                          на Windows его нет, поэтому там только `?`)
+            Esc         — отменить ввод, Ctrl+U — стереть строку
 
 Ключи: $GROQ_API_KEY или ~/.config/transcribe/key
        $GEMINI_API_KEY или ~/.config/transcribe/gemini_key
@@ -31,21 +32,26 @@ import queue
 import re
 import select
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
-import termios
 import textwrap
 import threading
 import time
-import tty
 import wave
 from datetime import datetime
 from pathlib import Path
 
 import numpy as np
 import requests
+
+IS_WINDOWS = os.name == "nt"
+if IS_WINDOWS:
+    import ctypes
+    import msvcrt
+else:
+    import termios
+    import tty
 
 # --- аудио ---------------------------------------------------------------
 SAMPLE_RATE = 16000
@@ -64,8 +70,14 @@ LIMIT_ASH = 7200      # секунд аудио в час
 LIMIT_ASD = 28800     # секунд аудио в сутки
 MIN_BILLED = 10       # короче — всё равно тарифицируется как 10с
 
-STATE_DIR = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "transcribe"
-CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "transcribe"
+if IS_WINDOWS:
+    _APPDATA = Path(os.environ.get("APPDATA") or Path.home())
+    CONFIG_DIR = _APPDATA / "transcribe"
+    STATE_DIR = Path(os.environ.get("LOCALAPPDATA") or _APPDATA) / "transcribe"
+else:
+    STATE_DIR = Path(os.environ.get("XDG_STATE_HOME",
+                                    Path.home() / ".local/state")) / "transcribe"
+    CONFIG_DIR = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "transcribe"
 
 LABELS = {"mic": "mic", "speaker": "spk"}
 
@@ -118,8 +130,43 @@ def pactl(*args):
         return ""
 
 
+def _win_sc():
+    """soundcard подтягиваем лениво: на Linux он не нужен."""
+    try:
+        import soundcard
+        return soundcard
+    except ImportError:
+        die("на Windows нужен пакет soundcard: pip install soundcard")
+
+
+def _win_sources():
+    sc = _win_sc()
+    out = []
+    for m in sc.all_microphones(include_loopback=False):
+        out.append((m.id, m.name, False))
+    for sp in sc.all_speakers():
+        out.append((sp.id, f"Monitor of {sp.name}", True))
+    return out
+
+
+def _win_default_mic():
+    try:
+        return _win_sc().default_microphone().id
+    except Exception:
+        return None
+
+
+def _win_default_monitor():
+    try:
+        return _win_sc().default_speaker().id
+    except Exception:
+        return None
+
+
 def all_sources():
     """[(name, description, is_monitor)] — все источники записи."""
+    if IS_WINDOWS:
+        return _win_sources()
     out = []
     raw = pactl("-f", "json", "list", "sources")
     if raw:
@@ -139,10 +186,14 @@ def all_sources():
 
 
 def default_mic():
+    if IS_WINDOWS:
+        return _win_default_mic()
     return pactl("get-default-source") or None
 
 
 def default_monitor():
+    if IS_WINDOWS:
+        return _win_default_monitor()
     sink = pactl("get-default-sink")
     return f"{sink}.monitor" if sink else None
 
@@ -356,7 +407,35 @@ class Chunker:
 # Захват
 # ==========================================================================
 
-class Capture(threading.Thread):
+class WindowsCapture(threading.Thread):
+    """Захват через WASAPI (soundcard). Системный звук — loopback устройства вывода."""
+
+    def __init__(self, src, device, sink, stop, state):
+        super().__init__(daemon=True)
+        self.src, self.device, self.sink, self.stop, self.state = src, device, sink, stop, state
+
+    def run(self):
+        sc = _win_sc()
+        try:
+            mic = sc.get_microphone(self.device, include_loopback=(self.src == "speaker"))
+        except Exception as e:
+            self.state.fatal = f"устройство {self.device!r} не открылось: {e}"
+            self.stop.set()
+            return
+        try:
+            with mic.recorder(samplerate=SAMPLE_RATE, channels=1,
+                              blocksize=FRAME_SAMPLES) as rec:
+                while not self.stop.is_set():
+                    data = rec.record(numframes=FRAME_SAMPLES)
+                    frame = data[:, 0] if getattr(data, "ndim", 1) > 1 else data
+                    self.sink(self.src, np.ascontiguousarray(frame, dtype=np.float32))
+        except Exception as e:
+            if not self.stop.is_set():
+                self.state.fatal = f"поток {self.src} оборвался: {e}"
+                self.stop.set()
+
+
+class PosixCapture(threading.Thread):
     def __init__(self, src, device, sink, stop, state):
         super().__init__(daemon=True)
         self.src, self.device, self.sink, self.stop, self.state = src, device, sink, stop, state
@@ -539,6 +618,9 @@ class Gemini:
             except Exception as e:
                 problems.append(f"{model}: {e}")
         raise RuntimeError("все модели недоступны — " + "; ".join(problems[-3:]))
+
+
+Capture = WindowsCapture if IS_WINDOWS else PosixCapture
 
 
 class GeminiLive(threading.Thread):
@@ -725,43 +807,52 @@ class LocalBackend:
 # Экран: прокручиваемая область + закреплённая строка статуса
 # ==========================================================================
 
+def enable_vt():
+    """Старый conhost не понимает ANSI, пока не включить VT-обработку вывода."""
+    if not IS_WINDOWS:
+        return
+    try:
+        k = ctypes.windll.kernel32
+        handle = k.GetStdHandle(-11)                  # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if k.GetConsoleMode(handle, ctypes.byref(mode)):
+            k.SetConsoleMode(handle, mode.value | 0x0004)   # VIRTUAL_TERMINAL_PROCESSING
+    except Exception:
+        pass
+
+
 class Screen:
     def __init__(self, tui):
         self.tui = tui and sys.stdout.isatty()
         self.lock = threading.RLock()
         self.status = ""
         self.input = None          # не None => внизу строка ввода вопроса
+        self.input_full = False    # какой охват выбран при открытии
         self.old_term = None
-        self.dirty_size = False    # SIGWINCH только поднимает флаг, см. _apply_resize
         self.w, self.h = shutil.get_terminal_size((100, 24))
         if not self.tui:
             return
+        enable_vt()
         sys.stdout.write("\x1b[?25l")                 # спрятать курсор
         sys.stdout.write(f"\x1b[1;{self.h - 1}r")     # область прокрутки
         sys.stdout.write(f"\x1b[{self.h - 1};1H")
         sys.stdout.write("\x1b[>1u")                  # kitty keyboard: различать Shift+Enter
         sys.stdout.flush()
-        try:
-            signal.signal(signal.SIGWINCH, self._resize)
-        except ValueError:
-            pass
-
-    def _resize(self, *_):
-        """Обработчик сигнала: только флаг, никакого вывода.
-
-        Сигналы исполняются в основном потоке между байткодами, а lock здесь
-        реентрантный — обработчик спокойно захватит его повторно и вклинит свои
-        escape-последовательности в середину чужой записи. Поэтому вся работа
-        отложена в _apply_resize, который вызывается из обычного кода.
-        """
-        self.dirty_size = True
 
     def _apply_resize(self):
-        if not self.dirty_size:
+        """Размер опрашиваем, а не ловим SIGWINCH.
+
+        Сигнала SIGWINCH нет на Windows, а на Unix обработчик исполняется в
+        основном потоке между байткодами и, поскольку lock реентрантный,
+        спокойно вклинивал свои escape-последовательности в середину чужой
+        записи. Опрос вызывается из _draw() — то есть не реже раза в 0.25с —
+        и обходится в один вызов ioctl.
+        """
+        size = shutil.get_terminal_size((100, 24))
+        if (size.columns, size.lines) == (self.w, self.h):
             return
-        self.dirty_size = False
         old_h = self.h
-        self.w, self.h = shutil.get_terminal_size((100, 24))
+        self.w, self.h = size
         # при увеличении окна прежняя строка статуса оказывается внутри области
         # прокрутки и остаётся там мусором — стираем её на старом месте
         sys.stdout.write(f"\x1b[{old_h};1H\x1b[2K")
@@ -771,6 +862,8 @@ class Screen:
     def raw_input_mode(self):
         if not (self.tui and sys.stdin.isatty()):
             return
+        if IS_WINDOWS:
+            return                  # msvcrt читает без эха, режим менять не нужно
         self.old_term = termios.tcgetattr(sys.stdin.fileno())
         tty.setcbreak(sys.stdin.fileno())
 
@@ -789,17 +882,18 @@ class Screen:
             if self.tui:
                 self._draw()
 
-    def set_input(self, text):
+    def set_input(self, text, full=False):
         """text=None — закрыть строку ввода."""
         with self.lock:
             self.input = text
+            self.input_full = full
             if self.tui:
                 self._draw()
 
     def _draw(self):
         self._apply_resize()
         if self.input is not None:
-            line = "> " + self.input
+            line = ("?> " if self.input_full else "> ") + self.input
             if len(line) > self.w - 1:
                 line = line[-(self.w - 1):]
             sys.stdout.write(f"\x1b[{self.h};1H\x1b[2K\x1b[1;35m{line}\x1b[0m\x1b[?25h")
@@ -831,7 +925,39 @@ class Screen:
 # Чтение клавиш
 # ==========================================================================
 
-class KeyReader:
+class WindowsKeyReader:
+    """Читает через msvcrt: select на Windows принимает только сокеты, не stdin.
+
+    Windows Terminal не умеет kitty keyboard protocol, поэтому Shift+Enter здесь
+    неотличим от обычного Enter — «весь конспект» выбирается клавишей `?`
+    вместо `/` при открытии строки вопроса.
+    """
+
+    def key(self, timeout=0.3):
+        deadline = time.time() + timeout
+        while True:
+            if msvcrt.kbhit():
+                ch = msvcrt.getwch()
+                if ch in ("\x00", "\xe0"):     # префикс функциональных клавиш
+                    msvcrt.getwch()             # съедаем скан-код и игнорируем
+                    return None
+                if ch in ("\r", "\n"):
+                    return ("enter",)
+                if ch == "\x08":
+                    return ("backspace",)
+                if ch == "\x15":
+                    return ("clear",)
+                if ch == "\x1b":
+                    return ("esc",)
+                if ch == "\x03":
+                    return ("interrupt",)
+                return ("char", ch)
+            if time.time() >= deadline:
+                return None
+            time.sleep(0.01)
+
+
+class PosixKeyReader:
     """Читает с файлового дескриптора напрямую.
 
     select() видит только fd, а sys.stdin.read(1) утаскивает весь доступный кусок
@@ -891,7 +1017,12 @@ class KeyReader:
             return ("backspace",)
         if ch == "\x15":                   # Ctrl+U — стереть строку
             return ("clear",)
+        if ch == "\x03":
+            return ("interrupt",)
         return ("char", ch)
+
+
+KeyReader = WindowsKeyReader if IS_WINDOWS else PosixKeyReader
 
 
 # ==========================================================================
@@ -1116,6 +1247,7 @@ def run(args, backend, usage, out_path, gemini=None):
 
     def keys():
         buf = None                      # не None => набираем вопрос
+        full_default = False            # охват, выбранный клавишей открытия
         reader = KeyReader()
         while not stop.is_set():
             if not sys.stdin.isatty():
@@ -1125,6 +1257,11 @@ def run(args, backend, usage, out_path, gemini=None):
             if k is None:
                 continue
             kind = k[0]
+
+            if kind == "interrupt":     # Ctrl+C там, где его не ловит сигнал
+                state.quit = True
+                stop.set()
+                continue
 
             if buf is None:
                 if kind != "char":
@@ -1140,28 +1277,32 @@ def run(args, backend, usage, out_path, gemini=None):
                     screen.line(f"\x1b[1;36m─── метка {ts} ───\x1b[0m")
                     out.write(f"\n=== МЕТКА {ts} ===\n\n")
                 elif ch in ("/", "?"):
+                    # `?` сразу открывает вопрос по всему конспекту: на Windows
+                    # Shift+Enter неотличим от Enter, нужен другой способ
                     buf = ""
-                    screen.set_input(buf)
+                    full_default = (ch == "?")
+                    screen.set_input(buf, full_default)
                 continue
 
             if kind == "char":
                 buf += k[1]
-                screen.set_input(buf)
+                screen.set_input(buf, full_default)
             elif kind == "backspace":
                 buf = buf[:-1]
-                screen.set_input(buf)
+                screen.set_input(buf, full_default)
             elif kind == "clear":
                 buf = ""
-                screen.set_input(buf)
+                screen.set_input(buf, full_default)
             elif kind == "esc":
                 buf = None
                 screen.set_input(None)
             elif kind in ("enter", "shift_enter"):
                 question = buf.strip()
+                full = full_default or kind == "shift_enter"
                 buf = None
                 screen.set_input(None)
                 if question:
-                    ask(question, full=(kind == "shift_enter"))
+                    ask(question, full=full)
 
     # запуск
     if args.keep_audio:
@@ -1171,7 +1312,8 @@ def run(args, backend, usage, out_path, gemini=None):
     for s in sources:
         screen.line(f"\x1b[90m{LABELS[s]}: {devices[s]}\x1b[0m")
     screen.line(f"\x1b[90mпишу в {out_path}\x1b[0m")
-    hint = "space — пауза, m — метка, / — спросить Gemini, q — стоп"
+    hint = ("space — пауза, m — метка, / — вопрос по последним репликам, "
+            "? — по всему конспекту, q — стоп")
     screen.line("\x1b[90m" + "─" * 3 + f" {hint} " + "─" * 3 + "\x1b[0m")
 
     caps = [Capture(s, devices[s], on_frame, stop, state) for s in sources]

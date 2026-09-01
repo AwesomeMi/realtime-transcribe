@@ -18,8 +18,10 @@ The answer is written into the same transcript, clearly marked.
 
 ## Requirements
 
-- Linux with PipeWire or PulseAudio (`parec`, `pactl` — from `pipewire-pulse` or `libpulse`)
 - Python 3.10+
+- Linux: PipeWire or PulseAudio (`parec`, `pactl` — from `pipewire-pulse` or `libpulse`)
+- Windows: nothing extra beyond `pip install -r requirements.txt`, which pulls in
+  `soundcard` for WASAPI loopback capture
 - `ffmpeg` for `--file` mode
 - `pip install -r requirements.txt`
 
@@ -58,15 +60,14 @@ written line by line and flushed immediately, so a crash costs you nothing.
 |---|---|
 | `space` | pause / resume capture |
 | `m` | drop a marker at the current timestamp |
-| `/` | ask Gemini about the transcript |
+| `/` | ask about the **last N lines** (`--recent`, default 8) |
+| `?` | ask about the **entire transcript** |
 | `q` | stop and save |
 
-Inside the question prompt: `Enter` sends the last N lines as context
-(`--recent`, default 8), `Shift+Enter` sends the entire transcript, `Esc`
-cancels, `Ctrl+U` clears.
-
-`Shift+Enter` needs a terminal that speaks the kitty keyboard protocol (Ghostty,
-kitty, foot, WezTerm). Everywhere else use `Alt+Enter`, which does the same thing.
+Inside the question prompt: `Enter` sends, `Esc` cancels, `Ctrl+U` clears the
+line. `Shift+Enter` also forces whole-transcript scope, but that needs a terminal
+speaking the kitty keyboard protocol (Ghostty, kitty, foot, WezTerm) — Windows
+Terminal cannot distinguish it from plain `Enter`, which is why `?` exists.
 
 ## Choosing a backend
 
@@ -133,15 +134,24 @@ by comparing a rotated run against an unrotated one — identical character coun
 
 | | status |
 |---|---|
-| Linux (PipeWire / PulseAudio) | works, this is what it was built and tested on |
-| Windows | not yet — see below |
-| macOS | untested; capture would need the same work as Windows |
+| Linux (PipeWire / PulseAudio) | works; built and regression-tested here |
+| Windows | code is in place but **not yet run by anyone** — see below |
+| macOS | untested; would need a capture backend of its own |
 
-About 13% of the code is platform-specific: device enumeration via `pactl`,
-capture via `parec`, raw keyboard reads, and `termios`/`SIGWINCH`. The other 87%
-— VAD, chunking, quota accounting, both API clients, the TUI — is portable.
-Windows support is being developed on the `windows-support` branch rather than as
-a permanent fork, so bug fixes never have to be applied twice.
+Roughly 13% of the code is platform-specific and it is isolated at three seams —
+device enumeration, audio capture, and raw keyboard reads — each with a `Posix*`
+and a `Windows*` implementation picked at import time. The other 87% (VAD,
+chunking, quota accounting, both API clients, the TUI) is shared, which is
+exactly why this is one branch and not a permanent fork: a fix in shared code
+would otherwise have to be applied twice.
+
+Windows uses `soundcard` for WASAPI loopback, `msvcrt` for keystrokes, and
+`%APPDATA%` / `%LOCALAPPDATA%` for config and state. Terminal resize is polled
+rather than signalled, so `SIGWINCH` is gone from both platforms.
+
+**The Windows path has never been executed.** It was written against the API docs
+and a previously working WASAPI prototype, and verified only statically. Expect
+rough edges; issue reports welcome.
 
 ## Repository layout
 
