@@ -1210,111 +1210,135 @@ class State:
 # Main run
 # ==========================================================================
 
-def run(args, backend, usage, out_path, gemini=None):
-    stop = threading.Event()
-    state = State()
-    work = queue.Queue()
-    sources = ["mic", "speaker"] if args.source == "both" else [args.source]
+class Session:
+    """One recording session: capture -> VAD/chunking -> backend -> file and screen.
 
-    # Resolve the devices before creating Screen: resolve_source may terminate the
-    # program via die(), and by then Screen would have already hidden the cursor,
-    # narrowed the scrolling region and enabled the kitty keyboard protocol.
-    devices = {}
-    if "mic" in sources:
-        devices["mic"] = resolve_source("mic", args.mic_device)
-    if "speaker" in sources:
-        devices["speaker"] = resolve_source("speaker", args.speaker_device)
+    This used to be a single 330-line function whose thirteen closures all shared
+    the same handful of objects. They are methods now, which is what that shared
+    state was asking for all along, and each one can be exercised on its own.
+    """
 
-    screen = Screen(not args.no_tui)
-    vads = {s: Vad(args.vad_threshold) for s in sources}
-    prompts = {s: "" for s in sources}
-    # one writer per source: Wave_write is not thread-safe, and mixing mic and
-    # speaker into a single mono stream is pointless — two speakers become mush
-    dump = {"w": {}, "by_frame": bool(args.keep_audio)}
+    def __init__(self, args, backend, usage, out_path, gemini=None):
+        self.args = args
+        self.backend = backend
+        self.usage = usage
+        self.gemini = gemini
+        self.out_path = out_path
 
-    def dump_path(src):
-        if args.source == "both":
-            return out_path.with_suffix(f".{LABELS[src]}.wav")
-        return out_path.with_suffix(".wav")
+        self.stop = threading.Event()
+        self.state = State()
+        self.work = queue.Queue()
+        self.sources = ["mic", "speaker"] if args.source == "both" else [args.source]
+        self.caps = []
 
-    out = open(out_path, "a", encoding="utf-8", buffering=1)
+        # Resolve the devices before creating Screen: resolve_source may terminate
+        # the program via die(), and by then Screen would have already hidden the
+        # cursor, narrowed the scrolling region and enabled the kitty protocol.
+        self.devices = {}
+        if "mic" in self.sources:
+            self.devices["mic"] = resolve_source("mic", args.mic_device)
+        if "speaker" in self.sources:
+            self.devices["speaker"] = resolve_source("speaker", args.speaker_device)
 
-    def wout(text):
+        self.screen = Screen(not args.no_tui)
+        self.vads = {s: Vad(args.vad_threshold) for s in self.sources}
+        self.prompts = {s: "" for s in self.sources}
+        # one writer per source: Wave_write is not thread-safe, and mixing mic and
+        # speaker into a single mono stream is pointless — two speakers become mush
+        self.dump = {"w": {}, "by_frame": bool(args.keep_audio)}
+
+        self.out = open(out_path, "a", encoding="utf-8", buffering=1)
+        self.out.write(f"# Transcript — {datetime.now():%Y-%m-%d %H:%M}\n")
+        if args.backend == "gemini-live":
+            self.out.write(f"# Source: {args.source} | engine: {args.live_model}\n\n")
+        else:
+            self.out.write(f"# Source: {args.source} | language: {args.lang} "
+                           f"| model: {args.model}\n\n")
+
+        self.chunkers = {s: Chunker(s, args.min_chunk, args.max_chunk, args.silence,
+                                    self._emit_chunk) for s in self.sources}
+        self.live = self._make_live()
+
+    # --- output ----------------------------------------------------------
+
+    def _dump_path(self, src):
+        if self.args.source == "both":
+            return self.out_path.with_suffix(f".{LABELS[src]}.wav")
+        return self.out_path.with_suffix(".wav")
+
+    def _wout(self, text):
         """Background threads may append after the file is already closed (for
         example if a request hung and join timed out) — silently skip it."""
-        if not out.closed:
-            out.write(text)
+        if not self.out.closed:
+            self.out.write(text)
 
-    out.write(f"# Transcript — {datetime.now():%Y-%m-%d %H:%M}\n")
-    if args.backend == "gemini-live":
-        out.write(f"# Source: {args.source} | engine: {args.live_model}\n\n")
-    else:
-        out.write(f"# Source: {args.source} | language: {args.lang} | model: {args.model}\n\n")
-
-    def emit_chunk(src, audio):
-        state.pending += 1
-        work.put((src, audio))
-
-    chunkers = {s: Chunker(s, args.min_chunk, args.max_chunk, args.silence, emit_chunk)
-                for s in sources}
-
-    live = None
-    if args.backend == "gemini-live":
-        if gemini is None:
-            die("--backend gemini-live needs a Gemini key")
-        if args.source == "both":
-            die("--backend gemini-live works with one source: -s mic or -s speaker")
-
-        def on_final(text):
-            ts = datetime.now().strftime("%H:%M:%S")
-            state.transcript.append((ts, sources[0], text))
-            state.lines += 1
-            for i, ln in enumerate(screen.wrap(text, indent="") or [""]):
-                screen.line((f"\x1b[90m[{ts}]\x1b[0m " if i == 0 else "         ") + ln)
-            wout(f"[{ts}] {text}\n")
-
-        def on_interim(text):
-            state.interim = text
-
-        def on_note(msg):
-            screen.line(f"\x1b[33m{msg}\x1b[0m")
-
-        live = GeminiLive(gemini.key, on_final, on_interim, on_note,
-                          model=args.live_model, silence_ms=args.live_silence,
-                          flush_sec=args.live_flush)
-
-    def on_frame(src, frame):
-        if state.paused:
+    def _start_audio_dump(self, reason=None):
+        if self.dump["w"]:
             return
-        v = vads[src]
-        speaking = v.push(frame)
-        state.rms[src] = v.rms
-        state.speaking[src] = speaking
-        if live is not None:
-            live.speaking = speaking
-            live.feed(frame)
-        else:
-            chunkers[src].feed(frame, speaking)
-        if dump["by_frame"]:
-            w = dump["w"].get(src)
-            if w is not None:
-                w.writeframes((np.clip(frame, -1, 1) * 32767).astype("<i2").tobytes())
-
-    def start_audio_dump(reason=None):
-        if dump["w"]:
-            return
-        for src in sources:
-            w = wave.open(str(dump_path(src)), "wb")
+        for src in self.sources:
+            w = wave.open(str(self._dump_path(src)), "wb")
             w.setnchannels(1)
             w.setsampwidth(2)
             w.setframerate(SAMPLE_RATE)
-            dump["w"][src] = w
+            self.dump["w"][src] = w
         if reason:
-            names = ", ".join(dump_path(x).name for x in sources)
-            screen.line(f"\x1b[33m!! {reason} — writing raw audio to {names}, "
-                        f"transcribe it later: ./rt.py --file <file>\x1b[0m")
+            names = ", ".join(self._dump_path(x).name for x in self.sources)
+            self.screen.line(f"\x1b[33m!! {reason} — writing raw audio to {names}, "
+                             f"transcribe it later: ./rt.py --file <file>\x1b[0m")
 
-    def gate(chunk_sec):
+    # --- audio in --------------------------------------------------------
+
+    def _emit_chunk(self, src, audio):
+        self.state.pending += 1
+        self.work.put((src, audio))
+
+    def _on_frame(self, src, frame):
+        if self.state.paused:
+            return
+        vad = self.vads[src]
+        speaking = vad.push(frame)
+        self.state.rms[src] = vad.rms
+        self.state.speaking[src] = speaking
+        if self.live is not None:
+            self.live.speaking = speaking
+            self.live.feed(frame)
+        else:
+            self.chunkers[src].feed(frame, speaking)
+        if self.dump["by_frame"]:
+            w = self.dump["w"].get(src)
+            if w is not None:
+                w.writeframes((np.clip(frame, -1, 1) * 32767).astype("<i2").tobytes())
+
+    # --- Gemini Live backend ---------------------------------------------
+
+    def _make_live(self):
+        if self.args.backend != "gemini-live":
+            return None
+        if self.gemini is None:
+            die("--backend gemini-live needs a Gemini key")
+        if self.args.source == "both":
+            die("--backend gemini-live works with one source: -s mic or -s speaker")
+        return GeminiLive(self.gemini.key, self._on_final, self._on_interim, self._on_note,
+                          model=self.args.live_model, silence_ms=self.args.live_silence,
+                          flush_sec=self.args.live_flush)
+
+    def _on_final(self, text):
+        ts = datetime.now().strftime("%H:%M:%S")
+        self.state.transcript.append((ts, self.sources[0], text))
+        self.state.lines += 1
+        for i, ln in enumerate(self.screen.wrap(text, indent="") or [""]):
+            self.screen.line((f"\x1b[90m[{ts}]\x1b[0m " if i == 0 else "         ") + ln)
+        self._wout(f"[{ts}] {text}\n")
+
+    def _on_interim(self, text):
+        self.state.interim = text
+
+    def _on_note(self, msg):
+        self.screen.line(f"\x1b[33m{msg}\x1b[0m")
+
+    # --- Groq backend ----------------------------------------------------
+
+    def _gate(self, chunk_sec):
         """'ok' — safe to send; 'quota' — the daily limit is used up.
 
         Hourly limits are simply waited out. But if we are already stopping, wait
@@ -1322,93 +1346,117 @@ def run(args, backend, usage, out_path, gemini=None):
         """
         waited = 0.0
         while True:
-            st = usage.stats()
+            st = self.usage.stats()
             if st["req_day"] >= LIMIT_RPD or st["sec_day"] + chunk_sec > LIMIT_ASD:
                 return "quota"
             if st["rpm"] >= LIMIT_RPM - 1 or st["sec_hour"] + chunk_sec > LIMIT_ASH:
-                if stop.is_set() and waited >= 60:
+                if self.stop.is_set() and waited >= 60:
                     return "quota"
                 time.sleep(3)
                 waited += 3
                 continue
             return "ok"
 
-    def worker():
+    def _spill_chunk(self, src, audio):
+        """Quota is gone — keep the audio so it can be transcribed later."""
+        if self.dump["by_frame"]:
+            return
+        w = self.dump["w"].get(src)
+        if w is not None:
+            w.writeframes((np.clip(audio, -1, 1) * 32767).astype("<i2").tobytes())
+
+    def _worker(self):
         while True:
-            item = work.get()
+            item = self.work.get()
             if item is None:
                 break
             src, audio = item
             dur = len(audio) / SAMPLE_RATE
             try:
-                if not args.no_quota_guard and gate(dur) == "quota":
-                    if not state.quota_out:
-                        state.quota_out = True
-                        start_audio_dump("today's limit is used up")
-                    if not dump["by_frame"]:
-                        w = dump["w"].get(src)
-                        if w is not None:
-                            w.writeframes(
-                                (np.clip(audio, -1, 1) * 32767).astype("<i2").tobytes())
+                if not self.args.no_quota_guard and self._gate(dur) == "quota":
+                    if not self.state.quota_out:
+                        self.state.quota_out = True
+                        self._start_audio_dump("today's limit is used up")
+                    self._spill_chunk(src, audio)
                     continue
-                text = backend.transcribe(audio, prompts[src])
-                usage.add(dur)
-                state.sent += 1
+                text = self.backend.transcribe(audio, self.prompts[src])
+                self.usage.add(dur)
+                self.state.sent += 1
                 if text:
-                    prompts[src] = (prompts[src] + " " + text)[-600:]
+                    self.prompts[src] = (self.prompts[src] + " " + text)[-600:]
                     ts = datetime.now().strftime("%H:%M:%S")
-                    state.transcript.append((ts, src, text))
-                    label = f"[{LABELS[src]}] " if args.source == "both" else ""
-                    screen.line(f"\x1b[90m[{ts}]\x1b[0m {label}{text}")
-                    wout(f"[{ts}] {label}{text}\n")
-                    state.lines += 1
+                    self.state.transcript.append((ts, src, text))
+                    label = f"[{LABELS[src]}] " if self.args.source == "both" else ""
+                    self.screen.line(f"\x1b[90m[{ts}]\x1b[0m {label}{text}")
+                    self._wout(f"[{ts}] {label}{text}\n")
+                    self.state.lines += 1
             except Exception as e:
-                state.failed += 1
-                screen.line(f"\x1b[31m[!] chunk lost: {e}\x1b[0m")
-                wout(f"[!! chunk of {dur:.0f}s lost: {e}]\n")
+                self.state.failed += 1
+                self.screen.line(f"\x1b[31m[!] chunk lost: {e}\x1b[0m")
+                self._wout(f"[!! chunk of {dur:.0f}s lost: {e}]\n")
             finally:
-                state.pending -= 1
-                work.task_done()
+                self.state.pending -= 1
+                self.work.task_done()
 
-    def ask(question, full):
-        if gemini is None:
-            screen.line("\x1b[31mGemini is not configured: put the key in "
-                        "~/.config/transcribe/gemini_key\x1b[0m")
+    # --- questions -------------------------------------------------------
+
+    def _ask(self, question, full):
+        if self.gemini is None:
+            self.screen.line("\x1b[31mGemini is not configured: put the key in "
+                             "~/.config/transcribe/gemini_key\x1b[0m")
             return
-        lines = list(state.transcript)
+        lines = list(self.state.transcript)
         if not full:
-            lines = lines[-args.recent:]
+            lines = lines[-self.args.recent:]
         if not lines:
-            screen.line("\x1b[31mnothing to ask about yet — the transcript is empty\x1b[0m")
+            self.screen.line("\x1b[31mnothing to ask about yet — "
+                             "the transcript is empty\x1b[0m")
             return
         scope = (f"whole transcript, {len(lines)} lines" if full
                  else f"last {len(lines)} lines")
-        ctx = "\n".join(
-            f"[{ts}] " + (f"[{LABELS[sr]}] " if args.source == "both" else "") + tx
-            for ts, sr, tx in lines)
-        screen.line(f"\x1b[1;35m>>> [{scope}] {question}\x1b[0m")
-        wout(f"\n>>> QUESTION ({scope}): {question}\n")
+        both = self.args.source == "both"
+        ctx = "\n".join(f"[{ts}] " + (f"[{LABELS[sr]}] " if both else "") + tx
+                        for ts, sr, tx in lines)
+        self.screen.line(f"\x1b[1;35m>>> [{scope}] {question}\x1b[0m")
+        self._wout(f"\n>>> QUESTION ({scope}): {question}\n")
+        threading.Thread(target=self._answer, args=(ctx, question), daemon=True).start()
 
-        def do_ask():
-            state.asking += 1
-            try:
-                answer, model = gemini.ask(ctx, question)
-            except Exception as e:
-                answer, model = f"(Gemini error: {e})", "—"
-            finally:
-                state.asking -= 1
-            for ln in screen.wrap(answer):
-                screen.line(f"\x1b[36m{ln}\x1b[0m")
-            screen.line(f"\x1b[90m    ── {model}\x1b[0m")
-            wout(f"<<< [{model}] {answer}\n\n")
+    def _answer(self, ctx, question):
+        self.state.asking += 1
+        try:
+            answer, model = self.gemini.ask(ctx, question)
+        except Exception as e:
+            answer, model = f"(Gemini error: {e})", "—"
+        finally:
+            self.state.asking -= 1
+        for ln in self.screen.wrap(answer):
+            self.screen.line(f"\x1b[36m{ln}\x1b[0m")
+        self.screen.line(f"\x1b[90m    ── {model}\x1b[0m")
+        self._wout(f"<<< [{model}] {answer}\n\n")
 
-        threading.Thread(target=do_ask, daemon=True).start()
+    # --- keyboard --------------------------------------------------------
 
-    def keys():
+    def _hotkey(self, ch):
+        """Returns "" to start typing a question about recent lines, "?" about
+        the whole transcript, None if the key was handled or means nothing."""
+        if ch in ("q", "Q"):
+            self.state.quit = True
+            self.stop.set()
+        elif ch == " ":
+            self.state.paused = not self.state.paused
+        elif ch in ("m", "M"):
+            ts = datetime.now().strftime("%H:%M:%S")
+            self.screen.line(f"\x1b[1;36m─── mark {ts} ───\x1b[0m")
+            self._wout(f"\n=== MARK {ts} ===\n\n")
+        elif ch in ("/", "?"):
+            return ch
+        return None
+
+    def _keys(self):
         buf = None                      # not None => typing a question
         full_default = False            # scope picked by the opening key
         reader = KeyReader()
-        while not stop.is_set():
+        while not self.stop.is_set():
             if not sys.stdin.isatty():
                 time.sleep(1)
                 continue
@@ -1418,131 +1466,138 @@ def run(args, backend, usage, out_path, gemini=None):
             kind = k[0]
 
             if kind == "interrupt":     # Ctrl+C where the signal misses it
-                state.quit = True
-                stop.set()
+                self.state.quit = True
+                self.stop.set()
                 continue
 
             if buf is None:
-                if kind != "char":
-                    continue
-                ch = k[1]
-                if ch in ("q", "Q"):
-                    state.quit = True
-                    stop.set()
-                elif ch == " ":
-                    state.paused = not state.paused
-                elif ch in ("m", "M"):
-                    ts = datetime.now().strftime("%H:%M:%S")
-                    screen.line(f"\x1b[1;36m─── mark {ts} ───\x1b[0m")
-                    out.write(f"\n=== MARK {ts} ===\n\n")
-                elif ch in ("/", "?"):
-                    # `?` opens a question about the whole transcript right away:
-                    # on Windows Shift+Enter is the same as Enter, so we need another way
-                    buf = ""
-                    full_default = (ch == "?")
-                    screen.set_input(buf, full_default)
+                if kind == "char":
+                    opened = self._hotkey(k[1])
+                    if opened is not None:
+                        # `?` asks about the whole transcript right away: on Windows
+                        # Shift+Enter is the same as Enter, so it needs its own key
+                        buf = ""
+                        full_default = opened == "?"
+                        self.screen.set_input(buf, full_default)
                 continue
 
             if kind == "char":
                 buf += k[1]
-                screen.set_input(buf, full_default)
+                self.screen.set_input(buf, full_default)
             elif kind == "backspace":
                 buf = buf[:-1]
-                screen.set_input(buf, full_default)
+                self.screen.set_input(buf, full_default)
             elif kind == "clear":
                 buf = ""
-                screen.set_input(buf, full_default)
+                self.screen.set_input(buf, full_default)
             elif kind == "esc":
                 buf = None
-                screen.set_input(None)
+                self.screen.set_input(None)
             elif kind in ("enter", "shift_enter"):
                 question = buf.strip()
                 full = full_default or kind == "shift_enter"
                 buf = None
-                screen.set_input(None)
+                self.screen.set_input(None)
                 if question:
-                    ask(question, full=full)
+                    self._ask(question, full=full)
 
-    # start
-    if args.keep_audio:
-        start_audio_dump()
+    # --- status line -----------------------------------------------------
 
-    screen.raw_input_mode()
-    for s in sources:
-        screen.line(f"\x1b[90m{LABELS[s]}: {devices[s]}\x1b[0m")
-    screen.line(f"\x1b[90mwriting to {out_path}\x1b[0m")
-    hint = ("space — pause, m — mark, / — question about the recent lines, "
-            "? — about the whole transcript, q — stop")
-    screen.line("\x1b[90m" + "─" * 3 + f" {hint} " + "─" * 3 + "\x1b[0m")
+    def _status(self):
+        st = self.usage.stats()
+        elapsed = time.time() - self.state.started
+        src = self.sources[0]
+        level = min(1.0, self.state.rms[src] / 0.15)
+        bar = ("▁▂▃▄▅▆▇█"[min(7, int(level * 8))] * 3
+               if not self.state.paused else "···")
+        mark = ("● PAUSED" if self.state.paused
+                else "● SPEECH" if any(self.state.speaking.values()) else "○ silence")
+        if self.live is not None:
+            link = "live" if self.live.connected else "no link"
+            head = (f" {mark} {hms(elapsed)} │ {bar} │ {link} · "
+                    f"sessions {self.live.sessions} │ lines {self.state.lines} │ ")
+            tail = self.state.interim.replace("\n", " ")
+            room = max(0, self.screen.w - len(head) - 2)
+            return head + ("…" + tail[-room + 1:] if len(tail) > room else tail)
+        buffered = len(self.chunkers[src].buf) * FRAME_MS / 1000
+        return (f" {mark} {hms(elapsed)} │ {bar} │ buf {buffered:4.1f}s │ "
+                f"queue {self.state.pending} │ lines {self.state.lines} │ "
+                f"today {st['req_day']}/{LIMIT_RPD} req · "
+                f"{compact(st['sec_day'])}/{compact(LIMIT_ASD)} audio"
+                + (" │ ✦ Gemini…" if self.state.asking else "")
+                + ("  QUOTA EXHAUSTED" if self.state.quota_out else ""))
 
-    caps = [Capture(s, devices[s], on_frame, stop, state) for s in sources]
-    if live is not None:
-        live.start()
-    wrk = threading.Thread(target=worker, daemon=True)
-    kb = threading.Thread(target=keys, daemon=True)
-    for c in caps:
-        c.start()
-    wrk.start()
-    kb.start()
+    # --- lifecycle -------------------------------------------------------
 
-    try:
-        while not stop.is_set():
-            st = usage.stats()
-            el = time.time() - state.started
-            bar_src = sources[0]
-            level = min(1.0, state.rms[bar_src] / 0.15)
-            bar = "▁▂▃▄▅▆▇█"[min(7, int(level * 8))] * 3 if not state.paused else "···"
-            mark = "● PAUSED" if state.paused else ("● SPEECH" if any(state.speaking.values()) else "○ silence")
-            buf = len(chunkers[bar_src].buf) * FRAME_MS / 1000
-            if live is not None:
-                link = "live" if live.connected else "no link"
-                head = (f" {mark} {hms(el)} │ {bar} │ {link} · sessions {live.sessions} │ "
-                        f"lines {state.lines} │ ")
-                tail = state.interim.replace("\n", " ")
-                room = max(0, screen.w - len(head) - 2)
-                screen.set_status(head + ("…" + tail[-room + 1:] if len(tail) > room else tail))
-            else:
-                screen.set_status(
-                    f" {mark} {hms(el)} │ {bar} │ buf {buf:4.1f}s │ queue {state.pending} │ "
-                    f"lines {state.lines} │ today {st['req_day']}/{LIMIT_RPD} req · "
-                    f"{compact(st['sec_day'])}/{compact(LIMIT_ASD)} audio"
-                    + (f" │ \u2726 Gemini…" if state.asking else "")
-                    + ("  QUOTA EXHAUSTED" if state.quota_out else "")
-                )
-            time.sleep(0.25)
-    except KeyboardInterrupt:
-        pass
-    except Exception as e:                  # otherwise we would fly past screen.close()
-        state.fatal = f"UI failure: {e}"
-    finally:
-        stop.set()
+    def _start(self):
+        if self.args.keep_audio:
+            self._start_audio_dump()
+        self.screen.raw_input_mode()
+        for s in self.sources:
+            self.screen.line(f"\x1b[90m{LABELS[s]}: {self.devices[s]}\x1b[0m")
+        self.screen.line(f"\x1b[90mwriting to {self.out_path}\x1b[0m")
+        hint = ("space — pause, m — mark, / — question about the recent lines, "
+                "? — about the whole transcript, q — stop")
+        self.screen.line("\x1b[90m" + "─" * 3 + f" {hint} " + "─" * 3 + "\x1b[0m")
 
-    screen.set_status(" stopping, finishing the queue…")
-    if live is not None:
-        live.stop.set()
-        live.join(timeout=60)
-    for c in caps:              # otherwise feed() from capture races with flush()
-        c.join(timeout=3)
-    for c in chunkers.values():
-        c.flush()
-    work.put(None)
-    wrk.join(timeout=180)
+        self.caps = [Capture(s, self.devices[s], self._on_frame, self.stop, self.state)
+                     for s in self.sources]
+        if self.live is not None:
+            self.live.start()
+        self.worker_thread = threading.Thread(target=self._worker, daemon=True)
+        self.keys_thread = threading.Thread(target=self._keys, daemon=True)
+        for c in self.caps:
+            c.start()
+        self.worker_thread.start()
+        self.keys_thread.start()
 
-    for w in dump["w"].values():
-        w.close()
-    out.write(f"\n# end, {hms(time.time() - state.started)}\n")
-    out.close()
-    screen.close()
+    def _shutdown(self):
+        self.screen.set_status(" stopping, finishing the queue…")
+        if self.live is not None:
+            self.live.stop.set()
+            self.live.join(timeout=60)
+        for c in self.caps:         # otherwise feed() from capture races with flush()
+            c.join(timeout=3)
+        for c in self.chunkers.values():
+            c.flush()
+        self.work.put(None)
+        self.worker_thread.join(timeout=180)
 
-    out_path = apply_title(out_path, gemini, args.title)
-    print(f"\nSaved: {out_path}")
-    print(f"Lines: {state.lines} | requests: {state.sent} | chunks lost: {state.failed}")
-    for src in dump["w"]:
-        print(f"Raw audio: {dump_path(src)}")
-    if state.fatal:
-        print(f"\nError: {state.fatal}", file=sys.stderr)
-    print_quota(usage)
+        for w in self.dump["w"].values():
+            w.close()
+        self.out.write(f"\n# end, {hms(time.time() - self.state.started)}\n")
+        self.out.close()
+        self.screen.close()
 
+    def _report(self):
+        self.out_path = apply_title(self.out_path, self.gemini, self.args.title)
+        print(f"\nSaved: {self.out_path}")
+        print(f"Lines: {self.state.lines} | requests: {self.state.sent} "
+              f"| chunks lost: {self.state.failed}")
+        for src in self.dump["w"]:
+            print(f"Raw audio: {self._dump_path(src)}")
+        if self.state.fatal:
+            print(f"\nError: {self.state.fatal}", file=sys.stderr)
+        print_quota(self.usage)
+
+    def run(self):
+        self._start()
+        try:
+            while not self.stop.is_set():
+                self.screen.set_status(self._status())
+                time.sleep(0.25)
+        except KeyboardInterrupt:
+            pass
+        except Exception as e:          # otherwise we would fly past screen.close()
+            self.state.fatal = f"UI failure: {e}"
+        finally:
+            self.stop.set()
+        self._shutdown()
+        self._report()
+
+
+def run(args, backend, usage, out_path, gemini=None):
+    Session(args, backend, usage, out_path, gemini).run()
 
 # ==========================================================================
 # Batch mode: transcribe an existing file through the same pipeline
