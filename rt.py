@@ -287,14 +287,32 @@ def sanitize_title(title, limit=60):
     return t.strip(" .")
 
 
-def apply_title(path, gemini, enabled):
+def confirm(question, default=True):
+    """Yes/no prompt. Keeps the default when nobody is there to answer."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        return default
+    try:
+        answer = input(f"{question} {'[Y/n]' if default else '[y/N]'} ").strip().lower()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return False                    # bailing out means leave the file alone
+    if not answer:
+        return default
+    return answer[0] in "yд"            # 'д' so "да" works too
+
+
+def apply_title(path, gemini, mode):
     """Rename a finished transcript to '<original stem> <topic>'.
+
+    mode: True — always, False — never, None — ask, which is what happens when
+    the filename was generated rather than chosen. A non-interactive run keeps
+    the default and titles anyway, so unattended batches still get named.
 
     Returns the path to use from here on — the original one if anything went
     wrong, because a transcript sitting under a dull name beats one lost to a
     failed rename.
     """
-    if not enabled or gemini is None or not path.exists():
+    if mode is False or gemini is None or not path.exists():
         return path
     try:
         text = path.read_text(encoding="utf-8")
@@ -302,6 +320,8 @@ def apply_title(path, gemini, enabled):
         return path
     body = "\n".join(l for l in text.splitlines() if l and not l.startswith("#"))
     if len(body) < 200:                       # too little said to name it
+        return path
+    if mode is None and not confirm("Name this transcript by its subject?"):
         return path
     if len(body) > 40000:                     # head and tail are enough for a title
         body = body[:20000] + "\n[...]\n" + body[-20000:]
@@ -1676,11 +1696,11 @@ def build_parser():
                    help="Gemini reasoning depth (default low — for speed)")
     p.add_argument("--gemini-key", help="Gemini key (otherwise $GEMINI_API_KEY)")
     p.add_argument("--title", dest="title", action="store_true", default=None,
-                   help="rename the finished transcript to '<date> <topic>', the topic "
-                        "written by a cheap Gemini model (default: on unless -o already "
-                        "names the file)")
+                   help="rename the finished transcript to '<date> <topic>' without "
+                        "asking; by default you are asked once the session ends, and "
+                        "never asked at all when -o already names the file")
     p.add_argument("--no-title", dest="title", action="store_false",
-                   help="keep the plain timestamp filename")
+                   help="keep the plain timestamp filename, no question asked")
     p.add_argument("--file", metavar="FILE",
                    help="do not record from a device, transcribe an existing file "
                         "(any format ffmpeg can read)")
@@ -1721,8 +1741,8 @@ def main():
         out_path = Path.home() / "Documents/transcripts" / f"{datetime.now():%Y-%m-%d_%H%M}.txt"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if args.title is None:
-        args.title = args.out is None       # never touch a name the user picked
+    if args.title is None and args.out is not None:
+        args.title = False                  # never touch a name the user picked
 
     gkey = read_key(args.gemini_key, "GEMINI_API_KEY", "gemini_key")
     chain = [(args.gemini_model, 0)] if args.gemini_model else GEMINI_CHAIN
