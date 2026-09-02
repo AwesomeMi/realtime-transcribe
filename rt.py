@@ -472,9 +472,15 @@ class WindowsCapture(threading.Thread):
                 self.state.fatal = f"stream {self.src} died: {type(e).__name__}: {e!r}"
                 self.stop.set()
         finally:
-            stream.stop_stream()
-            stream.close()
-            audio.terminate()
+            # each step guarded on its own: if stop_stream() raises on an
+            # already-dead stream, terminate() must still run or the PyAudio
+            # instance leaks, and the exception would escape the thread and
+            # bury the real reason in state.fatal
+            for cleanup in (stream.stop_stream, stream.close, audio.terminate):
+                try:
+                    cleanup()
+                except Exception:
+                    pass
 
 
 class PosixCapture(threading.Thread):
