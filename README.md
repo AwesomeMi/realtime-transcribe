@@ -179,6 +179,19 @@ rather than signalled, so `SIGWINCH` is gone from both platforms.
 and system-audio loopback capture work; microphone support depends on the active
 Windows endpoint and its driver. Expect rough edges; issue reports welcome.
 
+## Repository layout
+
+```
+rt.py         entry point and the command line
+session.py    Session — one recording; batch mode; naming a finished transcript
+devices.py    device enumeration and capture, Posix and Windows side by side
+backends.py   Groq Whisper, Gemini questions, Gemini Live
+audio.py      voice activity detection, chunking, WAV encoding
+quota.py      free-tier accounting that survives a restart
+config.py     constants, paths, small shared helpers
+ui.py         the pinned status line, keystrokes, session state
+```
+
 ## License
 
 MIT
