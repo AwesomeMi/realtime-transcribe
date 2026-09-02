@@ -85,6 +85,21 @@ GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
 
 # Fallback chain: the good ones on top, but with 20 requests per day; below —
 # the backups with 500 and 14400. Numbers are free tier daily limits as of 2026-09-02.
+# Naming a file is a mechanical job — start from the models with the widest daily
+# allowance so titling never eats the 20-per-day quota reserved for real questions.
+GEMINI_TITLE_CHAIN = [
+    ("gemini-3.5-flash-lite", 500),
+    ("gemini-3.1-flash-lite", 500),
+    ("gemma-4-31b-it", 14400),
+    ("gemini-3.5-flash", 20),
+]
+
+GEMINI_TITLE_SYSTEM = (
+    "You name transcript files. Reply with the title only: 2 to 6 words, in the "
+    "language of the transcript, naming its actual subject. No quotes, no date, "
+    "no trailing period, and never words like 'lecture', 'meeting' or 'transcript'."
+)
+
 GEMINI_CHAIN = [
     ("gemini-3.7-flash", 20),
     ("gemini-3.6-flash", 20),
@@ -256,6 +271,60 @@ def list_devices():
         if is_mon:
             print(f"  {'*' if name == dmon else ' '} {desc}\n      {name}")
     print("\n* — default.  Pick another: --mic-device NAME_PART / --speaker-device NAME_PART\n")
+
+
+BAD_IN_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def sanitize_title(title, limit=60):
+    """Make a model-written line safe as a filename on Linux and Windows alike."""
+    # substitute rather than delete: dropping the separator in "C#/SQL" or a
+    # newline would glue neighbouring words into one
+    t = BAD_IN_FILENAME.sub(" ", title)
+    t = re.sub(r"\s+", " ", t).strip(" .")     # Windows rejects trailing dots/spaces
+    if len(t) > limit:
+        t = t[:limit].rsplit(" ", 1)[0]
+    return t.strip(" .")
+
+
+def apply_title(path, gemini, enabled):
+    """Rename a finished transcript to '<original stem> <topic>'.
+
+    Returns the path to use from here on — the original one if anything went
+    wrong, because a transcript sitting under a dull name beats one lost to a
+    failed rename.
+    """
+    if not enabled or gemini is None or not path.exists():
+        return path
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return path
+    body = "\n".join(l for l in text.splitlines() if l and not l.startswith("#"))
+    if len(body) < 200:                       # too little said to name it
+        return path
+    if len(body) > 40000:                     # head and tail are enough for a title
+        body = body[:20000] + "\n[...]\n" + body[-20000:]
+    try:
+        raw, model = gemini.title(body)
+    except Exception as e:
+        print(f"title: skipped ({e})", file=sys.stderr)
+        return path
+    slug = sanitize_title(raw)
+    if not slug:
+        return path
+    target = path.with_name(f"{path.stem} {slug}{path.suffix}")
+    i = 2
+    while target.exists() and target != path:
+        target = path.with_name(f"{path.stem} {slug} ({i}){path.suffix}")
+        i += 1
+    try:
+        path.rename(target)
+    except OSError as e:
+        print(f"title: could not rename ({e})", file=sys.stderr)
+        return path
+    print(f"Title: {slug}   [{model}]")
+    return target
 
 
 def die(msg):
@@ -621,11 +690,11 @@ class Gemini:
                 outs.append(txt)
         return outs[-1].strip() if outs else None
 
-    def _call(self, model, prompt, retry_without_thinking=True):
+    def _call(self, model, prompt, system=GEMINI_SYSTEM, retry_without_thinking=True):
         st = self.state[model]
         body = {
             "model": model,
-            "system_instruction": GEMINI_SYSTEM,
+            "system_instruction": system,
             "input": prompt,
             "generation_config": {"temperature": 0.3},
         }
@@ -637,7 +706,7 @@ class Gemini:
 
         if r.status_code == 400 and "thinking" in r.text.lower() and retry_without_thinking:
             st["thinking"] = False          # the model has its own levels — go without it
-            return self._call(model, prompt, retry_without_thinking=False)
+            return self._call(model, prompt, system, retry_without_thinking=False)
         if r.status_code == 429:
             daily = any(w in r.text.lower() for w in ("per day", "perday", "daily"))
             if daily:
@@ -651,6 +720,26 @@ class Gemini:
         if not text:
             raise RuntimeError(f"empty response: {json.dumps(r.json())[:200]}")
         return text
+
+    def _walk(self, chain, prompt, system):
+        """Returns (text, model). Walks the chain until someone answers."""
+        problems = []
+        now = time.time()
+        for model in chain:
+            st = self.state.setdefault(model, {"thinking": True, "until": 0.0, "dead": False})
+            if st["dead"] or now < st["until"]:
+                continue
+            try:
+                return self._call(model, prompt, system), model
+            except Exception as e:
+                problems.append(f"{model}: {e}")
+        raise RuntimeError("every model is unavailable — " + "; ".join(problems[-3:]))
+
+    def title(self, transcript):
+        """Short subject line for a finished transcript."""
+        return self._walk([m for m, _ in GEMINI_TITLE_CHAIN],
+                          f"Transcript:\n\n{transcript}\n\n---\n\nTitle:",
+                          GEMINI_TITLE_SYSTEM)
 
     def ask(self, context, question):
         """Returns (answer, model). Walks the chain until someone answers."""
@@ -1425,6 +1514,7 @@ def run(args, backend, usage, out_path, gemini=None):
     out.close()
     screen.close()
 
+    out_path = apply_title(out_path, gemini, args.title)
     print(f"\nSaved: {out_path}")
     print(f"Lines: {state.lines} | requests: {state.sent} | chunks lost: {state.failed}")
     for src in dump["w"]:
@@ -1438,7 +1528,7 @@ def run(args, backend, usage, out_path, gemini=None):
 # Batch mode: transcribe an existing file through the same pipeline
 # ==========================================================================
 
-def run_file(args, backend, usage, src_path, out_path):
+def run_file(args, backend, usage, src_path, out_path, gemini=None):
     if not src_path.exists():
         die(f"no such file: {src_path}")
     # stderr into a temp file rather than a pipe: nobody reads the pipe until stdout
@@ -1511,6 +1601,7 @@ def run_file(args, backend, usage, src_path, out_path):
 
     out.write(f"\n# end, {hms(pos)} of audio\n")
     out.close()
+    out_path = apply_title(out_path, gemini, args.title)
     print(f"\n\nSaved: {out_path}")
     print(f"Lines: {lines} | requests: {sent} | chunks lost: {failed}")
     print_quota(usage)
@@ -1584,6 +1675,12 @@ def build_parser():
     p.add_argument("--thinking", default="low", choices=["low", "medium", "high"],
                    help="Gemini reasoning depth (default low — for speed)")
     p.add_argument("--gemini-key", help="Gemini key (otherwise $GEMINI_API_KEY)")
+    p.add_argument("--title", dest="title", action="store_true", default=None,
+                   help="rename the finished transcript to '<date> <topic>', the topic "
+                        "written by a cheap Gemini model (default: on unless -o already "
+                        "names the file)")
+    p.add_argument("--no-title", dest="title", action="store_false",
+                   help="keep the plain timestamp filename")
     p.add_argument("--file", metavar="FILE",
                    help="do not record from a device, transcribe an existing file "
                         "(any format ffmpeg can read)")
@@ -1624,13 +1721,17 @@ def main():
         out_path = Path.home() / "Documents/transcripts" / f"{datetime.now():%Y-%m-%d_%H%M}.txt"
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    if args.file:
-        run_file(args, backend, usage, Path(args.file).expanduser(), out_path)
-        return
+    if args.title is None:
+        args.title = args.out is None       # never touch a name the user picked
 
     gkey = read_key(args.gemini_key, "GEMINI_API_KEY", "gemini_key")
     chain = [(args.gemini_model, 0)] if args.gemini_model else GEMINI_CHAIN
     gemini = Gemini(gkey, chain, args.thinking) if gkey else None
+
+    if args.file:
+        run_file(args, backend, usage, Path(args.file).expanduser(), out_path, gemini)
+        return
+
     if gemini is None:
         print("note: no Gemini key — questions about the transcript ('/') are unavailable",
               file=sys.stderr)
