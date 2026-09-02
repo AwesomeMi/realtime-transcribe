@@ -179,13 +179,6 @@ rather than signalled, so `SIGWINCH` is gone from both platforms.
 and system-audio loopback capture work; microphone support depends on the active
 Windows endpoint and its driver. Expect rough edges; issue reports welcome.
 
-## Repository layout
-
-```
-rt.py         the whole tool
-reference/    earlier prototypes built on local faster-whisper, kept for reference
-```
-
 ## License
 
 MIT
